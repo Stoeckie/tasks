@@ -115,6 +115,9 @@ class EtebaseSynchronizer(
         for ((calendar, collection) in fetched) {
             perList(collection, problems) { pushLocalChanges(account, client, calendar, collection, moves.adopted, problems) }
         }
+        // files that sync wrote and no task links any more go, but only when every list arrived: a task moved
+        // elsewhere links its files again in its new list
+        if (problems.isEmpty() && fetched.size == collections.size) attachments.cleanUp()
         return problems
     }
 
@@ -264,7 +267,10 @@ class EtebaseSynchronizer(
                     moves.alsoMovedHere.add(Triple(caldavTask, movedTo, base))
                     return null // cached once followed: until then its last content is the base
                 }
-                caldavTask.isDeleted() -> caldavDao.delete(caldavTask)
+                caldavTask.isDeleted() -> {
+                    caldavDao.delete(caldavTask) // the old item of a move of this device, deleted elsewhere
+                    moveDone(caldavTask.task)
+                }
                 movedTo != null && (changedHere(caldavCalendar, caldavTask) || hasMovedRows(caldavTask)) -> {
                     moves.pending.add(caldavTask to movedTo)
                     return null
@@ -323,6 +329,7 @@ class EtebaseSynchronizer(
         for ((old, first, base) in moves.alsoMovedHere) {
             caldavDao.delete(old)
             val task = old.task
+            moveDone(task)
             val rows = caldavDao.getTasks(task)
             if (rows.none { !it.isDeleted() } || rows.any { pushed(account, client, it) }) continue // two copies
             val there = follow(account, moves, first).second ?: continue
@@ -577,6 +584,18 @@ class EtebaseSynchronizer(
         }
     }
 
+    /**
+     * The last old item of a move of [task] is gone (deleted by this device or another one): the removals recorded
+     * here that the task's pushed VTODO lacks are done (until now they kept the old item from carrying them back).
+     */
+    private suspend fun moveDone(task: Long) {
+        val rows = caldavDao.getTasks(task)
+        if (rows.any { it.isDeleted() }) return
+        val row = rows.singleOrNull() ?: return
+        val pushed = caldavDao.getCalendar(row.calendar!!)?.let { vtodoCache.getVtodo(it, row) } ?: return
+        attachments.pushed(task, fromVtodo(pushed)?.let(::parse).orEmpty().map { it.id }, moved = false)
+    }
+
     private suspend fun upload(
         client: EtebaseClient,
         collection: Collection,
@@ -596,6 +615,7 @@ class EtebaseSynchronizer(
             val caldavTask = change.caldavTask
             if (change.item.isDeleted) {
                 forget(caldavTask)
+                moveDone(caldavTask.task)
             } else {
                 vtodoCache.putVtodo(caldavCalendar, caldavTask, change.vtodo)
                 // the row as it is now: the user may have moved the task during the upload

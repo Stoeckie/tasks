@@ -40,8 +40,9 @@ data class AttachmentLimits(
  * identifies the attachment; the SHA-256 verifies a download. Items never change, so bytes travel only when an
  * attachment is added: one upload, and one download on each device that has no file with that id.
  *
- * Nothing here deletes a file. A reference is dropped only when the user removed the attachment on some device: on
- * this device that is recorded ([removed]) until the push; elsewhere it shows as a reference that the new VTODO lacks.
+ * A reference is dropped only when the user removed the attachment on some device: on this device that is recorded
+ * ([removed]) until the push; elsewhere it shows as a reference that the new VTODO lacks. The only file ever deleted
+ * is one that sync wrote on this device and that nothing needs any more ([cleanUp]); a file the user picked stays.
  * An attachment that this device could not download is linked to a file row without file (a placeholder), which the
  * next change of the task on the server tries to fill, as a row restored from a backup.
  */
@@ -93,8 +94,8 @@ class EtebaseAttachments(
         links.forEach { link(task, it) }
         for (file in local) {
             if (remote.none { it.id == file.remoteId } && base.any { it.id == file.remoteId }) {
-                dao.delete(task, file.remoteId) // removed on another device; the file stays
-                if (moving) dao.insertRemoved(MetadataTombstone(TaskAttachmentDao.REMOVED, "$task/${file.remoteId}", currentTimeMillis()))
+                dao.delete(task, file.remoteId) // removed on another device (a file sync wrote goes: cleanUp)
+                if (moving) dao.insertRecord(MetadataTombstone(TaskAttachmentDao.REMOVED, "$task/${file.remoteId}", currentTimeMillis()))
             }
         }
     }
@@ -199,7 +200,7 @@ class EtebaseAttachments(
         val gone = before.filter { ref -> after.none { it.id == ref.id } }
         for (ref in gone) {
             dao.delete(task, ref.id)
-            dao.insertRemoved(MetadataTombstone(TaskAttachmentDao.REMOVED, "$task/${ref.id}", currentTimeMillis()))
+            dao.insertRecord(MetadataTombstone(TaskAttachmentDao.REMOVED, "$task/${ref.id}", currentTimeMillis()))
         }
         return gone.isNotEmpty()
     }
@@ -214,7 +215,7 @@ class EtebaseAttachments(
         addedHere(from, base).filter { it.remoteId !in there }.forEach { link(to, it) }
         dao.getRemoved(from).forEach { id ->
             dao.delete(to, id)
-            dao.insertRemoved(MetadataTombstone(TaskAttachmentDao.REMOVED, "$to/$id", currentTimeMillis()))
+            dao.insertRecord(MetadataTombstone(TaskAttachmentDao.REMOVED, "$to/$id", currentTimeMillis()))
         }
     }
 
@@ -233,12 +234,38 @@ class EtebaseAttachments(
 
     /** The user removed [files] from [task] on this device: the next push drops their references. */
     suspend fun removed(task: Long, files: Collection<TaskAttachment>) = files.forEach {
-        dao.insertRemoved(MetadataTombstone(TaskAttachmentDao.REMOVED, "$task/${it.remoteId}", currentTimeMillis()))
+        dao.insertRecord(MetadataTombstone(TaskAttachmentDao.REMOVED, "$task/${it.remoteId}", currentTimeMillis()))
     }
 
     /** The user added [files] to [task] on this device (perhaps again). */
     suspend fun added(task: Long, files: Collection<TaskAttachment>) = files.forEach {
         dao.deleteRemoved(task, it.remoteId)
+    }
+
+    /**
+     * Deletes the files that sync wrote on this device (not one the user picked or copied there) and their rows, once no
+     * task links them and no removal made here is still to be pushed: removed on another device, or their task deleted.
+     * Called only after a sync of an account that fetched every list and skipped nothing, so that a task moved by another
+     * device has arrived in its new list and linked its files again. When in doubt the file stays: a row that names
+     * another file now, or is gone, only loses its record.
+     */
+    suspend fun cleanUp() {
+        if (!store.keepsFiles) return
+        val records = dao.getSynced().takeIf { it.isNotEmpty() } ?: return
+        val linked = dao.getLinked().toHashSet()
+        val removed = dao.getAllRemoved().mapTo(HashSet()) { it.substringAfter('/') }
+        for (record in records) {
+            val id = record.substringBefore('/')
+            val uri = record.substringAfter('/')
+            if (id in linked || id in removed) continue
+            // the row first, in one statement that checks the links again; the file only once its row is gone
+            if (dao.deleteUnlinked(id, uri) > 0) {
+                if (!store.delete(uri)) Logger.w("EtebaseAttachments") { "Cannot delete the file of $id" }
+            } else if (dao.getAttachment(id)?.uri == uri) {
+                continue // linked meanwhile
+            }
+            dao.deleteSynced(record)
+        }
     }
 
     /** Why an attachment of [size] bytes after [count] attachments of [bytes] in total does not sync. */
@@ -271,6 +298,8 @@ class EtebaseAttachments(
             return null
         }
         val uri = store.create(ref.name, ref.mimeType, data) ?: return null
+        // written by sync: deleted when no task links it any more (see cleanUp)
+        dao.insertRecord(MetadataTombstone(TaskAttachmentDao.SYNCED, "${ref.id}/$uri", currentTimeMillis()))
         if (known != null) {
             dao.update(known.copy(uri = uri)) // not insert: a replaced row would lose its links
             return known.copy(uri = uri)

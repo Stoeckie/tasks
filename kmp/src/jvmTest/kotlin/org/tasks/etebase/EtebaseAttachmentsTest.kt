@@ -30,6 +30,7 @@ class EtebaseAttachmentsTest : DatabaseTest() {
         override suspend fun mimeType(uri: String) = "image/png"
         override suspend fun create(name: String, mimeType: String?, data: ByteArray) =
             "mem://${files.size}/$name".also { files[it] = data }
+        override suspend fun delete(uri: String) = true.also { files.remove(uri) }
     }
 
     private val dao = db.taskAttachmentDao()
@@ -431,5 +432,140 @@ class EtebaseAttachmentsTest : DatabaseTest() {
         assertEquals("", dao.getAttachment("BAD")!!.uri) // a placeholder
         push(t2, vtodo(*remote.unknownProperties.toTypedArray()))
         assertEquals(emptyList<String>(), deleted)
+    }
+
+    // files that sync wrote are deleted once nothing needs them (the phone test of 25-11: they stayed for good)
+
+    private suspend fun uri(id: String) = dao.getAttachment(id)?.uri
+
+    /** Device B received [id] for [task] (downloaded: written by sync). */
+    private suspend fun received(task: Long, id: String, data: ByteArray = bytes(1000, id.hashCode())): ByteArray {
+        val remote = vtodo(ref(data, "u-$id", id))
+        pull(task, remote, base = null)
+        assertArrayEquals(data, store.files[uri(id)])
+        return data
+    }
+
+    private suspend fun deleteTask(task: Long) = db.deletionDao().delete(listOf(task)) {}
+
+    @Test
+    fun fileRemovedElsewhereIsDeletedWithItsRow() = runBlocking {
+        val task = newTask()
+        val data = received(task, "f1")
+        val file = uri("f1")!!
+        attachments.cleanUp()
+        assertArrayEquals("linked: kept", data, store.files[file])
+        pull(task, vtodo(), base = vtodo(ref(data, "u-f1", "f1")))
+        assertEquals(emptySet<String>(), linked(task))
+        attachments.cleanUp()
+        assertNull(store.files[file])
+        assertNull(dao.getAttachment("f1"))
+        assertEquals(emptyList<String>(), dao.getSynced())
+    }
+
+    @Test
+    fun fileThatTheUserPickedIsNeverDeleted() = runBlocking {
+        val task = newTask()
+        val data = bytes(1000)
+        addFile(task, "mine", data)
+        val remote = vtodo(ref(data, "u1", "mine"))
+        pull(task, vtodo(), base = remote) // removed on another device
+        assertEquals(emptySet<String>(), linked(task))
+        attachments.cleanUp()
+        assertArrayEquals(data, store.files["mem://local/mine"])
+        assertEquals("mem://local/mine", uri("mine"))
+        // also when the user copied a file into the attachments directory itself: no row, no record
+        store.files["mem://0/copied.png"] = data
+        attachments.cleanUp()
+        assertArrayEquals(data, store.files["mem://0/copied.png"])
+    }
+
+    @Test
+    fun fileLinkedByTwoTasksStaysWhenOneUnlinksIt() = runBlocking {
+        val t1 = newTask()
+        val t2 = newTask()
+        val data = received(t1, "f1")
+        // a duplicate made on another device: another item, the same file id, linked without download
+        val copy = vtodo(ref(data, "u-copy", "f1"))
+        pull(t2, copy, base = null)
+        assertEquals(listOf("u-f1"), downloads)
+        pull(t1, vtodo(), base = vtodo(ref(data, "u-f1", "f1")))
+        attachments.cleanUp()
+        assertEquals(setOf("f1"), linked(t2))
+        assertArrayEquals(data, store.files[uri("f1")])
+        pull(t2, vtodo(), base = copy)
+        val file = uri("f1")!!
+        attachments.cleanUp()
+        assertNull(store.files[file])
+    }
+
+    @Test
+    fun fileOfATaskDeletedElsewhereIsDeleted() = runBlocking {
+        val task = newTask()
+        received(task, "f1")
+        received(task, "f2")
+        val files = listOf(uri("f1")!!, uri("f2")!!)
+        deleteTask(task)
+        attachments.cleanUp()
+        files.forEach { assertNull(store.files[it]) }
+        assertNull(dao.getAttachment("f1"))
+        assertNull(dao.getAttachment("f2"))
+    }
+
+    @Test
+    fun fileOfAMovedTaskStaysWithTheMovedCopy() = runBlocking {
+        // another device moved the task: here its old row goes, the task in the new list links the same file
+        val old = newTask()
+        val data = received(old, "f1")
+        val moved = newTask()
+        pull(moved, vtodo(ref(data, "u-new", "f1")), base = null)
+        deleteTask(old)
+        attachments.cleanUp()
+        assertEquals(listOf("u-f1"), downloads)
+        assertEquals(setOf("f1"), linked(moved))
+        assertArrayEquals(data, store.files[uri("f1")])
+    }
+
+    @Test
+    fun fileRemovedHereStaysUntilTheRemovalIsPushed() = runBlocking {
+        val task = newTask()
+        received(task, "f1")
+        val file = uri("f1")!!
+        removeHere(task, "f1")
+        attachments.cleanUp()
+        assertTrue("removal not pushed yet: kept", store.files.containsKey(file))
+        val vtodo = vtodo(ref(store.files[file]!!, "u-f1", "f1"))
+        push(task, vtodo)
+        attachments.pushed(task, parse(vtodo).map { it.id }, moved = false)
+        attachments.cleanUp()
+        assertNull(store.files[file])
+    }
+
+    @Test
+    fun rowThatNamesAnotherFileNowKeepsBoth() = runBlocking {
+        val task = newTask()
+        received(task, "f1")
+        val file = uri("f1")!!
+        dao.update(dao.getAttachment("f1")!!.copy(uri = "mem://local/other"))
+        store.files["mem://local/other"] = bytes(5)
+        dao.delete(task, "f1")
+        attachments.cleanUp()
+        assertTrue(store.files.containsKey(file))
+        assertTrue(store.files.containsKey("mem://local/other"))
+        assertEquals(emptyList<String>(), dao.getSynced()) // only the record goes
+    }
+
+    @Test
+    fun fileCopiedFromAnOldItemIsWrittenBySync() = runBlocking {
+        // a move carried by a device without the file: it copies the item and keeps the file, which sync wrote
+        val task = newTask()
+        val data = bytes(1000)
+        val old = parse(vtodo(ref(data, "u-old", "f1")))
+        push(task, vtodo(), carried = old)
+        assertEquals(listOf("u-old"), copied)
+        val file = uri("f1")!!
+        dao.delete(task, "f1")
+        attachments.cleanUp()
+        assertNull(store.files[file])
     }
 }

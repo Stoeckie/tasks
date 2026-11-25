@@ -203,8 +203,62 @@ class EtebaseScenarioTest {
         assertEquals(0 to 0, transfers(a))
         assertEquals(0 to 0, transfers(b))
         assertEquals(1, b.files("t1").size)
-        assertEquals(1, attachmentItems(l1).size) // the item of a1 is deleted, its file stays on B
-        assertTrue(b.store.dir.list()!!.size >= 2)
+        assertEquals(1, attachmentItems(l1).size) // the item of a1 is deleted
+        // B wrote a1 when it received it: that file goes; the file the user picked on A stays there
+        assertEquals(1, b.store.deleted.size)
+        assertEquals(listOf(b.store.deleted.single().name), b.store.written.map { it.name })
+        assertEquals(1, b.store.dir.list()!!.size)
+        assertEquals(2, a.store.dir.list()!!.size)
+    }
+
+    /**
+     * Phone test 25-11: files that sync wrote on a device go when no task there links them any more (removed or
+     * deleted elsewhere); a task moved elsewhere keeps them, and the files the user picked are never deleted.
+     */
+    @Test
+    fun filesWrittenBySyncGoWhenNothingLinksThem() = runBlocking {
+        val a = device("A")
+        val b = device("B")
+        val t1 = a.newTask(l1, "t1").id
+        val t2 = a.newTask(l1, "t2").id
+        val r1 = a.attach(t1, "r1.jpg", random(50_000, 71)).remoteId
+        a.attach(t1, "r2.jpg", random(50_000, 72))
+        a.attach(t2, "s1.jpg", random(50_000, 73))
+        val mine = b.attach(b.newTask(l1, "mine").id, "mine.jpg", random(50_000, 74)).remoteId
+        synced(a)
+        synced(b)
+        synced(a)
+        assertEquals(3, b.store.written.size)
+        // removed on A
+        a.detach(t1, r1)
+        synced(a)
+        synced(b)
+        assertEquals(1, b.store.deleted.size)
+        assertEquals(listOf("r2.jpg"), b.files("t1").keys.map { b.attachmentDao.getAttachment(it)!!.name })
+        // moved on A: the moved copy links the same files on B, nothing is downloaded or deleted
+        a.move(t1, l2)
+        synced(a)
+        val down = attachmentDownloads(b)
+        synced(b)
+        synced(b)
+        assertEquals(down, attachmentDownloads(b))
+        assertEquals(1, b.store.deleted.size)
+        assertTrue("still on B", b.files("t1").values.single() != null)
+        // deleted on A: its files go on B
+        a.delete(t2)
+        synced(a)
+        synced(b)
+        assertEquals(2, b.store.deleted.size)
+        assertEquals(setOf("t1", "mine"), b.tasks().map { it.first.title }.toSet())
+        // removed and deleted on B itself: the file the user picked stays, the one sync wrote goes
+        b.detach(b.task("mine"), mine)
+        b.delete(b.task("t1"))
+        synced(b)
+        synced(b)
+        assertEquals(3, b.store.deleted.size)
+        assertEquals(listOf(true), b.store.dir.listFiles()!!.map { it.name.startsWith("user-") })
+        assertEquals(b.store.deleted.toSet(), b.store.written.toSet())
+        assertEquals(emptyList<String>(), b.attachmentDao.getSynced())
     }
 
     @Test

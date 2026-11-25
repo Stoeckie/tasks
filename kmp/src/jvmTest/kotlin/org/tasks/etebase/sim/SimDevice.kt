@@ -52,6 +52,9 @@ import java.util.concurrent.TimeUnit
 class DirStore(val dir: File) : AttachmentStore {
     /** Files this store wrote for the sync. */
     val written = ArrayList<File>()
+    /** Files the sync deleted, and the SHA-256 of each. */
+    val deleted = ArrayList<File>()
+    val deletedSha256 = ArrayList<String>()
 
     override suspend fun size(uri: String) = file(uri)?.takeIf { it.isFile }?.length()
     override suspend fun read(uri: String, maxBytes: Int) =
@@ -67,9 +70,19 @@ class DirStore(val dir: File) : AttachmentStore {
         return file.toURI().toString()
     }
 
+    override suspend fun delete(uri: String) =
+        file(uri)?.let { file ->
+            deleted.add(file)
+            if (file.isFile) deletedSha256.add(org.tasks.etebase.EtebaseAttachments.sha256(file.readBytes()))
+            !file.exists() || (file.isFile && file.delete())
+        } ?: false
+
     /** A file the user picked: copied into the attachments directory, as the app does. */
     fun add(name: String, data: ByteArray): String =
-        File(dir, "user-${dir.list()!!.size}-${name.filter { it.isLetterOrDigit() }.take(20)}").also { it.writeBytes(data) }
+        generateSequence(dir.list()!!.size) { it + 1 }
+            .map { File(dir, "user-$it-${name.filter { c -> c.isLetterOrDigit() }.take(20)}") }
+            .first { !it.exists() } // (sync deletes files too: never write over one)
+            .also { it.writeBytes(data) }
             .toURI().toString()
 
     private fun file(uri: String): File? = try {

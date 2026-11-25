@@ -45,8 +45,11 @@ sealed class Step {
  * - all devices converge to the same tasks, fields and attachments, and the server holds the same;
  * - no attachment disappears unless a user removed it or deleted its task, and a removed one never comes back;
  * - attachment bytes travel only for new attachments: each installation downloads each file at most once and uploads
- *   it at most once, plus once per move and per duplicate it made of a task with it;
- * - files are written only into the attachments directory, within the limits.
+ *   it at most once, plus once per move and per duplicate it made of a task with it, and downloads it once more after
+ *   each time it deleted the file because no task linked it (a task with it came back: a move that won over a deletion
+ *   here, a duplicate made elsewhere);
+ * - files are written only into the attachments directory, within the limits;
+ * - sync deletes only files it wrote itself, and at quiescence every file it wrote that is still there is linked.
  */
 class SequenceDriver(
     private val live: Triple<String, String, String>? = null,
@@ -405,6 +408,7 @@ class SequenceDriver(
                 if (file.canonicalFile.parentFile != attachments) fail("path", "${dev.name} wrote $file")
                 if (file.length() > limits.maxBytes) fail("limit", "${dev.name} stored ${file.length()} bytes")
             }
+            dev.store.deleted.firstOrNull { it !in dev.store.written }?.let { fail("deleted", "${dev.name} deleted $it, not written by sync") }
             home.walk().filter { it.isFile }.forEach { file ->
                 val top = file.canonicalFile.relativeTo(home).path.substringBefore(File.separatorChar)
                 if (top !in setOf("attachments", "files", "vtodo")) fail("path", "${dev.name} wrote $file")
@@ -414,7 +418,8 @@ class SequenceDriver(
         private fun checkBytes(dev: SimDevice) {
             val downloads = HashMap<String, Int>()
             dev.counters.downloaded.forEach { (uid, count) -> fileOf[uid]?.let { downloads.merge(it, count, Int::plus) } }
-            downloads.entries.firstOrNull { it.value > 1 }
+            val cleaned = dev.store.deletedSha256.groupingBy { it }.eachCount()
+            downloads.entries.firstOrNull { (id, count) -> count > 1 + (content[id]?.let { cleaned[sha256(it)] } ?: 0) }
                 ?.let { fail("bytes", "${dev.name} downloaded ${it.key} ${it.value} times") }
             val uploads = HashMap<String, Int>()
             dev.counters.uploaded.keys.forEach { uid -> fileOf[uid]?.let { uploads.merge(it, 1, Int::plus) } }
@@ -477,6 +482,12 @@ class SequenceDriver(
                 }
                 val sorted = { m: Map<String, List<Pair<String, Set<String>>>> -> m.mapValues { (_, v) -> v.map { "${it.first}:${it.second.sorted()}" }.sorted() } }
                 if (sorted(here) != sorted(server)) fail("diverged", "${dev.name} has ${sorted(here)}, the server ${sorted(server)}")
+            }
+            // a file that sync wrote and no task links any more is deleted (the user does not see it)
+            for (dev in devices) {
+                val linked = dev.taskDao.getAll().flatMap { dev.attachmentDao.getAttachments(it.id) }.map { it.uri }.toSet()
+                dev.store.written.firstOrNull { it.exists() && it.toURI().toString() !in linked }
+                    ?.let { fail("orphan", "${dev.name} keeps ${it.name}, which no task links") }
             }
             val fields = devices.map { dev -> dev.tasks().map { (t, _) -> "${t.title}|${t.notes}|${t.priority}|${t.isCompleted}" }.sorted() }
             if (fields.distinct().size > 1) fail("diverged", "fields differ between devices: $fields")

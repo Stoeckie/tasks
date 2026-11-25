@@ -20,6 +20,9 @@ interface AttachmentStore {
      */
     suspend fun create(name: String, mimeType: String?, data: ByteArray): String?
 
+    /** Deletes the file at [uri] (never a directory); returns whether no file is there any more. */
+    suspend fun delete(uri: String): Boolean
+
     /** Platforms that keep no attachment files: references stay on the server untouched. */
     object None : AttachmentStore {
         override val keepsFiles = false
@@ -27,6 +30,7 @@ interface AttachmentStore {
         override suspend fun read(uri: String, maxBytes: Int): ByteArray? = null
         override suspend fun mimeType(uri: String): String? = null
         override suspend fun create(name: String, mimeType: String?, data: ByteArray): String? = null
+        override suspend fun delete(uri: String) = false
     }
 
     companion object {

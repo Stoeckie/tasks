@@ -42,11 +42,12 @@ interface TaskAttachmentDao {
     @Delete
     suspend fun delete(value: List<TaskAttachment>)
 
+    /** EteSync records in metadata_tombstone: [REMOVED] and [SYNCED]. */
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insertRecord(record: MetadataTombstone)
+
     // EteSync: attachments that the user removed from a task on this device, until the removal is pushed
     // (metadata_tombstone, key "<task>/<file id>")
-
-    @Insert(onConflict = OnConflictStrategy.REPLACE)
-    suspend fun insertRemoved(removed: MetadataTombstone)
 
     @Query("SELECT substr(entity_key, length(:task) + 2) FROM metadata_tombstone WHERE category = '$REMOVED' AND entity_key LIKE :task || '/%'")
     suspend fun getRemoved(task: Long): List<String>
@@ -57,7 +58,26 @@ interface TaskAttachmentDao {
     @Query("DELETE FROM metadata_tombstone WHERE category = '$REMOVED' AND entity_key LIKE :task || '/%'")
     suspend fun deleteRemoved(task: Long)
 
+    @Query("SELECT entity_key FROM metadata_tombstone WHERE category = '$REMOVED'")
+    suspend fun getAllRemoved(): List<String>
+
+    // EteSync: files that sync wrote on this device (metadata_tombstone, key "<file id>/<uri>"), deleted once unused
+
+    @Query("SELECT entity_key FROM metadata_tombstone WHERE category = '$SYNCED'")
+    suspend fun getSynced(): List<String>
+
+    @Query("DELETE FROM metadata_tombstone WHERE category = '$SYNCED' AND entity_key = :key")
+    suspend fun deleteSynced(key: String)
+
+    @Query("SELECT DISTINCT file_uuid FROM attachment")
+    suspend fun getLinked(): List<String>
+
+    /** Deletes the file row [id] if it still names [uri] and no task links it; returns whether it did. */
+    @Query("DELETE FROM attachment_file WHERE file_uuid = :id AND uri = :uri AND NOT EXISTS (SELECT 1 FROM attachment WHERE attachment.file_uuid = :id)")
+    suspend fun deleteUnlinked(id: String, uri: String): Int
+
     companion object {
         const val REMOVED = "etebase_attachment_removed"
+        const val SYNCED = "etebase_attachment_synced"
     }
 }

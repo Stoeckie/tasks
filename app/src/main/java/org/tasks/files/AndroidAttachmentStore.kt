@@ -73,4 +73,17 @@ class AndroidAttachmentStore(
             null
         }
     }
+
+    override suspend fun delete(uri: String): Boolean = withContext(Dispatchers.IO) {
+        try {
+            val parsed = uri.toUri()
+            when (parsed.scheme) {
+                ContentResolver.SCHEME_FILE -> File(parsed.path!!).let { !it.exists() || (it.isFile && it.delete()) }
+                else -> DocumentFile.fromSingleUri(context, parsed)?.let { !it.exists() || (it.isFile && it.delete()) } ?: false
+            }
+        } catch (e: Exception) {
+            Timber.w("Cannot delete attachment: ${e.javaClass.simpleName}")
+            false
+        }
+    }
 }

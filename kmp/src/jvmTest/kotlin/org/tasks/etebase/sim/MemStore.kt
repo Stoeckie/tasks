@@ -10,4 +10,5 @@ class MemStore : AttachmentStore {
     override suspend fun mimeType(uri: String) = "application/octet-stream"
     override suspend fun create(name: String, mimeType: String?, data: ByteArray) =
         "mem:///${files.size}/$name".also { files[it] = data }
+    override suspend fun delete(uri: String) = true.also { files.remove(uri) }
 }
