@@ -82,7 +82,7 @@ class EtebaseLiveTest {
 
     class Result(val up: Long, val down: Long, val requests: Long)
 
-    inner class Device(val name: String, val store: AttachmentStore = MemStore()) {
+    inner class Device(val name: String, val store: AttachmentStore = MemStore(), server: String = url!!) {
         private val up = AtomicLong()
         private val down = AtomicLong()
         private val requests = AtomicLong()
@@ -128,6 +128,7 @@ class EtebaseLiveTest {
             ),
             vtodoCache = vtodoCache, notifier = mock(),
         )
+        val attachments = EtebaseAttachments(attachmentDao, store)
         val taskDeleter = TaskDeleter(db.deletionDao(), taskDao, caldavDao, mock(), vtodoCache, mock(), mock())
         private val okHttp: OkHttpClient = OkHttpClient.Builder().addNetworkInterceptor { chain ->
             val request = chain.request()
@@ -141,10 +142,10 @@ class EtebaseLiveTest {
             }
             response.newBuilder().body(counting(response.body!!, down)).build()
         }.build()
-        val etebase: Account = Account.login(OkHttpBridge.createClient(okHttp, url!!), user, password())
+        val etebase: Account = Account.login(OkHttpBridge.createClient(okHttp, server), user, password())
         private val client = spy(EtebaseClient(dir.absolutePath, "$user-$name", etebase, caldavDao))
         var account = CaldavAccount(
-            uuid = "acc-$name", accountType = CaldavAccount.TYPE_ETEBASE, url = url, username = user, password = "x",
+            uuid = "acc-$name", accountType = CaldavAccount.TYPE_ETEBASE, url = server, username = user, password = "x",
         )
         val exceptions = ArrayList<Throwable>()
 
@@ -179,8 +180,7 @@ class EtebaseLiveTest {
                     exceptions.add(t)
                 }
             },
-            attachmentDao,
-            store,
+            attachments,
         )
 
         /** Syncs; [expectError] for a sync whose upload reply is lost on purpose. */
@@ -218,6 +218,7 @@ class EtebaseLiveTest {
         suspend fun remove(title: String, id: String) {
             val task = task(title).id
             attachmentDao.delete(task, id)
+            attachments.removed(task, listOf(attachmentDao.getAttachment(id)!!))
             dirtyDao.setDirty(listOf(task))
         }
 
@@ -464,13 +465,70 @@ class EtebaseLiveTest {
         c.sync("M1 C moves") // col comes first: its deletion waits for the push to col2
         c.sync("M2 C")
         assertEquals(0, taskItems(a, col).size)
-        assertEquals(1, attachmentItems(a, col).size) // the old item stays as an orphan
+        assertEquals(0, attachmentItems(a, col).size) // deleted with the old item
         assertEquals(1, taskItems(a, col2).size)
         assertEquals(1, attachmentItems(a, col2).size)
         val down = a.sync("M3 A receives the move").down
         assertTrue(down < 50_000) // A has the file: linked again, not downloaded
         assertArrayEquals(data, a.content("m1").single())
         assertEquals(a.calendar(col2).uuid, a.caldavDao.getTask(a.task("m1").id)!!.calendar)
+    }
+
+    /** REVIEW4 F1 and F6: an attachment added on another device while a move is under way is carried, nothing is left behind. */
+    @Test
+    fun attachmentAddedElsewhereDuringAMoveIsCarried() = runBlocking {
+        val a = device("A")
+        val c = device("C")
+        val col = newCollection(a, "r4-from")
+        val col2 = newCollection(a, "r4-to")
+        a.sync("R0 A")
+        a.newTask(col, "t")
+        a.attach("t", "f1", random(50_000, 41))
+        a.sync("R0 A")
+        c.sync("R0 C")
+        a.move("t", col2)
+        a.sync("R1 A moves") // col first: the old item stays until col2 has the task
+        c.attach("t", "x", random(60_000, 42)) // C has not seen the move yet
+        c.sync("R2 C adds x to the old list")
+        a.sync("R3 A")
+        c.sync("R4 C")
+        a.sync("R5 A")
+        c.sync("R6 C")
+        assertEquals(setOf("f1", "x"), a.attachmentDao.getAttachments(a.task("t").id).map { it.remoteId }.toSet())
+        assertEquals(setOf("f1", "x"), c.attachmentDao.getAttachments(c.task("t").id).map { it.remoteId }.toSet())
+        assertEquals(0, taskItems(a, col).size)
+        assertEquals(1, taskItems(a, col2).size)
+        assertEquals(0, attachmentItems(a, col).size) // F6: no orphans in the old list
+        assertEquals(2, attachmentItems(a, col2).size)
+    }
+
+    /**
+     * REVIEW4 F4: behind a proxy with a body limit (ETEBASE_TEST_LIMITED_SERVER, e.g. ~/etetest/v5/limitproxy.py with
+     * 1 MiB), a refused upload is not a sync error, the other lists sync, and the task is pushed without the file.
+     */
+    @Test
+    fun uploadRefusedByAProxyDoesNotStopTheOtherLists() = runBlocking {
+        val limited = System.getenv("ETEBASE_TEST_LIMITED_SERVER")
+        assumeTrue("set ETEBASE_TEST_LIMITED_SERVER to run", limited != null)
+        val a = Device("A", server = limited!!).also { devices.add(it) }
+        val b = device("B")
+        val col = newCollection(a, "limit-1")
+        val col2 = newCollection(a, "limit-2")
+        a.sync("X0 A")
+        a.newTask(col, "big")
+        a.attach("big", "big", random(2_000_000, 51))
+        a.newTask(col2, "small")
+        a.sync("X1 A, big refused")
+        assertEquals(1, taskItems(a, col2).size) // the list after it was synchronized
+        assertEquals(0, attachmentItems(a, col).size)
+        val failures = a.attachments.failures(a.task("big").id)
+        assertEquals(EtebaseAttachments.Companion.Problem.NOT_UPLOADED, failures["big"]?.second)
+        a.edit("big") { notes = "edited" }
+        val again = a.sync("X2 A, pushed without the refused file")
+        assertTrue(again.up < 20_000)
+        b.sync("X2 B")
+        assertEquals("edited", b.task("big").notes)
+        assertEquals(0, b.content("big").size)
     }
 
     @Test
@@ -512,7 +570,7 @@ class EtebaseLiveTest {
     }
 
     @Test
-    fun foreignInlineAttachmentIsConvertedOnFirstEdit() = runBlocking {
+    fun foreignInlineAttachmentStaysAsItIs() = runBlocking {
         val a = device("A")
         val b = device("B")
         val col = newCollection(a, "inline")
@@ -523,14 +581,12 @@ class EtebaseLiveTest {
         val im = itemManager(a, col)
         im.batch(arrayOf(im.create(ItemMetadata().apply { name = "f" }, foreignVtodo("f", "foreign", attach).toByteArray())))
         a.sync("I1 A"); b.sync("I1 B")
-        assertArrayEquals(data, b.content("foreign").single())
-        b.edit("foreign") { notes = "converted" }
-        assertTrue(b.sync("I2 B converts").up in 1_400_000..1_600_000)
-        assertTrue(a.sync("I2 receive A").down < 50_000) // A has the file already
-        a.edit("foreign") { notes = "after" }
-        assertTrue(a.sync("I3 A edits").up < 20_000)
-        assertTrue(b.sync("I3 receive B").down < 20_000)
-        assertEquals(1, a.content("foreign").size)
+        assertEquals(0, b.content("foreign").size) // not an attachment of this build: left alone
+        b.edit("foreign") { notes = "edited" }
+        assertTrue(b.sync("I2 B edits").up in 1_400_000..1_600_000) // the one exception: it travels with its VTODO
+        a.sync("I2 receive A")
+        val vtodo = String(itemManager(a, col).list(FetchOptions()).data.single().content)
+        assertTrue(vtodo.contains("X-FILENAME=foreign.bin") && vtodo.contains("edited"))
     }
 
     @Test

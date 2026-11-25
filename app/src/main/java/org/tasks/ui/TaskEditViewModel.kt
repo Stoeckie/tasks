@@ -67,6 +67,7 @@ import org.tasks.data.entity.SYNC_LOCATION
 import org.tasks.data.entity.SYNC_TAGS
 import org.tasks.data.entity.SYNC_ATTACHMENTS
 import org.tasks.data.entity.TagData
+import org.tasks.etebase.EtebaseAttachments
 import org.tasks.data.entity.Task
 import org.tasks.data.entity.Task.Companion.NOTIFY_MODE_FIVE
 import org.tasks.data.entity.Task.Companion.NOTIFY_MODE_NONSTOP
@@ -117,6 +118,7 @@ class TaskEditViewModel @Inject constructor(
     private val alarmDao: AlarmDao,
     private val taskAttachmentDao: TaskAttachmentDao,
     private val defaultFilterProvider: DefaultFilterProvider,
+    private val etebaseAttachments: EtebaseAttachments,
 ) : ViewModel() {
     private val resources = context.resources
     private var cleared = false
@@ -382,12 +384,10 @@ class TaskEditViewModel @Inject constructor(
         }
 
         if (originalState.value.attachments != _viewState.value.attachments) {
-            originalState.value.attachments
-                .minus(_viewState.value.attachments)
-                .map { it.remoteId }
-                .let { taskAttachmentDao.delete(task.id, it) }
-            _viewState.value.attachments
-                .minus(originalState.value.attachments)
+            val removed = originalState.value.attachments.minus(_viewState.value.attachments)
+            val added = _viewState.value.attachments.minus(originalState.value.attachments)
+            taskAttachmentDao.delete(task.id, removed.map { it.remoteId })
+            added
                 .map {
                     Attachment(
                         task = task.id,
@@ -400,6 +400,8 @@ class TaskEditViewModel @Inject constructor(
             if (_viewState.value.list.account.isEtebaseAccount) {
                 // only EteSync syncs attachments; elsewhere this would just bump the modification date
                 task.putTransitory(SYNC_ATTACHMENTS, true)
+                etebaseAttachments.removed(task.id, removed)
+                etebaseAttachments.added(task.id, added)
             }
         }
 

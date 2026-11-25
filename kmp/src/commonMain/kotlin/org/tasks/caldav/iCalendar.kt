@@ -202,6 +202,18 @@ class iCalendar(
         vtodo: String?,
         obj: String? = null,
         eTag: String? = null
+    ) = fromVtodo(account, calendar, existing, remote, vtodo, obj, eTag, cacheVtodo = !account.isOpenTasks)
+
+    /** [cacheVtodo] false: the caller writes the VTODO cache (the merge base) itself, once it applied the rest. */
+    suspend fun fromVtodo(
+        account: CaldavAccount,
+        calendar: CaldavCalendar,
+        existing: CaldavTask?,
+        remote: VTodo,
+        vtodo: String?,
+        obj: String?,
+        eTag: String?,
+        cacheVtodo: Boolean,
     ) {
         if (existing?.isDeleted() == true) {
             return
@@ -231,7 +243,7 @@ class iCalendar(
             vtodoCache.getVtodo(calendar, caldavTask)?.let { fromVtodo(it) }
         }
         if (dirty && local == null) {
-            if (!account.isOpenTasks) vtodoCache.putVtodo(calendar, caldavTask, vtodo)
+            if (cacheVtodo) vtodoCache.putVtodo(calendar, caldavTask, vtodo)
             caldavTask.etag = eTag
             caldavDao.update(caldavTask)
             return
@@ -305,7 +317,7 @@ class iCalendar(
             task.modificationDate = remoteModificationDate
         }
         taskSaver.save(task, original, dirty = false)
-        if (!account.isOpenTasks) vtodoCache.putVtodo(calendar, caldavTask, vtodo)
+        if (cacheVtodo) vtodoCache.putVtodo(calendar, caldavTask, vtodo)
         caldavTask.etag = eTag
         if (dirty) {
             // Keep the task dirty so the merged result is pushed next sync; do NOT markSynced (it

@@ -209,6 +209,8 @@ File %1$s contained %2$s.\n\n
   <string name="attachment_not_synced">%1$s is not synchronized: %2$s</string>
   <string name="attachment_not_synced_too_large">larger than %d MiB</string>
   <string name="attachment_not_synced_task_limit">over the limit of a task (number: %1$d, size: %2$d MiB)</string>
+  <string name="attachment_not_synced_not_downloaded">not downloaded yet, tried again later</string>
+  <string name="attachment_not_synced_refused">refused by the server (upload limit of a proxy?), tried again in a day</string>
   <string name="take_a_picture">Take a picture</string>
   <string name="pick_from_gallery">Pick from gallery</string>
   <string name="pick_from_storage">Pick from storage</string>

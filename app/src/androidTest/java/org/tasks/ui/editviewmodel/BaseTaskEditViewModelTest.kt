@@ -5,6 +5,8 @@ import com.todoroo.astrid.activity.TaskEditFragment
 import com.todoroo.astrid.alarms.AlarmService
 import org.tasks.data.dao.TaskDao
 import org.tasks.data.TaskSaver
+import org.tasks.etebase.EtebaseAttachments
+import org.tasks.files.AttachmentStore
 import com.todoroo.astrid.gcal.GCalHelper
 import org.tasks.service.TaskCompleter
 import org.tasks.service.TaskDeleter
@@ -91,6 +93,7 @@ open class BaseTaskEditViewModelTest : InjectingTestCase() {
             taskAttachmentDao = db.taskAttachmentDao(),
             alarmDao = db.alarmDao(),
             defaultFilterProvider = defaultFilterProvider,
+            etebaseAttachments = EtebaseAttachments(db.taskAttachmentDao(), AttachmentStore.None),
         )
     }
 

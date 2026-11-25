@@ -39,6 +39,19 @@ import org.tasks.location.MapPosition
 import org.tasks.preferences.AppPreferences
 import org.tasks.reminders.Random
 import org.tasks.service.TaskDeleter
+import com.etebase.client.exceptions.HttpException
+import com.etebase.client.exceptions.ServerErrorException
+import org.junit.Assert.assertNotEquals
+import org.mockito.kotlin.eq
+import org.tasks.data.entity.Attachment
+import org.tasks.data.entity.TaskAttachment
+import org.tasks.etebase.EtebaseAttachments.Companion.itemContent
+import org.tasks.etebase.EtebaseAttachments.Companion.sha256
+import org.tasks.time.DateTimeUtils2.currentTimeMillis
+import org.tasks.time.DateTimeUtils2.setCurrentMillisFixed
+import org.tasks.time.DateTimeUtils2.setCurrentMillisSystem
+import org.tasks.etebase.EtebaseAttachments.Companion.Problem
+import java.io.IOException
 import java.nio.file.Files
 
 /** Invariants 1 and 2: nothing received aborts the sync, and one bad item or task never stops the others. */
@@ -82,13 +95,14 @@ class EtebaseSynchronizerTest : DatabaseTest() {
         }
     }
     private val reported = ArrayList<Throwable>()
-    private val synchronizer = EtebaseSynchronizer(
+    private var store: AttachmentStore = AttachmentStore.None
+    private val synchronizer by lazy { EtebaseSynchronizer(
         caldavDao, dirtyDao, mock(), TaskDeleter(db.deletionDao(), taskDao, caldavDao, mock(), vtodoCache, mock(), mock()),
         mock { onBlocking { forAccount(any()) } doReturn client },
         iCal, vtodoCache,
         mock { on { reportException(any(), any()) } doAnswer { reported.add(it.getArgument(0)); Unit } },
-        db.taskAttachmentDao(), AttachmentStore.None,
-    )
+        EtebaseAttachments(db.taskAttachmentDao(), store),
+    ) }
     private lateinit var account: CaldavAccount
 
     private fun item(uid: String, content: String? = null, meta: ItemMetadata? = taskMeta): Item = mock {
@@ -161,5 +175,129 @@ class EtebaseSynchronizerTest : DatabaseTest() {
         verifyBlocking(client) { uploadChanges(any(), argThat { this == listOf(pushed) }) }
         assertTrue(dirtyDao.isDirty(caldavDao.getTask(bad.id)!!.id) == true)
         assertTrue(dirtyDao.isDirty(caldavDao.getTask(good.id)!!.id) != true)
+    }
+
+    private val files = HashMap<String, ByteArray>()
+
+    private fun data(seed: Long) = ByteArray(1000).also { java.util.Random(seed).nextBytes(it) }
+
+    /** An ATTACH reference to item u[id] holding [data], as this build writes it. */
+    private fun attach(id: String, data: ByteArray): String {
+        files["u$id"] = data
+        return "ATTACH;VALUE=URI;FILENAME=$id.bin;SIZE=${data.size};X-TASKS-ID=$id;X-TASKS-SHA256=${sha256(data)}:x-etebase-item:u$id\r\n"
+    }
+
+    private fun vtodo(uid: String, summary: String, vararg attach: String) =
+        vtodo(uid, summary).replace("END:VTODO", attach.joinToString("") + "END:VTODO")
+
+    private suspend fun linkFile(task: Long, id: String, data: ByteArray) {
+        val uri = "mem:///local/$id"
+        (store as EtebaseLiveTest.MemStore).files[uri] = data
+        db.taskAttachmentDao().insert(TaskAttachment(remoteId = id, name = "$id.bin", uri = uri))
+        val file = db.taskAttachmentDao().getAttachment(id)!!
+        db.taskAttachmentDao().insert(listOf(Attachment(task = task, fileId = file.id!!, attachmentUid = id)))
+    }
+
+    private suspend fun linked(task: Long) = db.taskAttachmentDao().getAttachments(task).map { it.remoteId }.toSet()
+
+    /** A task "t" in [calendar] that this device has synced with [vtodo]. */
+    private suspend fun syncedTask(vtodo: String, calendar: String = "cal"): Task {
+        val task = Task(title = "t").also { taskDao.createNew(it) }
+        val caldavTask = CaldavTask(task = task.id, calendar = calendar, remoteId = "t", obj = "t-item")
+        val id = caldavDao.insert(task, caldavTask, false)
+        vtodoCache.putVtodo(caldavDao.getCalendar(calendar)!!, caldavTask.copy(id = id), vtodo)
+        dirtyDao.markSynced(id)
+        return task
+    }
+
+    /** REVIEW4 F2: a download that is cut off leaves the base as it was, so a removal on another device still arrives. */
+    @Test
+    fun interruptedDownloadKeepsTheBase() = runBlocking {
+        setUp()
+        store = EtebaseLiveTest.MemStore()
+        val f = data(1); val g = data(2); val h = data(3)
+        val task = syncedTask(vtodo("t", "t", attach("F", f), attach("G", g)))
+        linkFile(task.id, "F", f)
+        linkFile(task.id, "G", g)
+        // another device removed G and added H
+        page = { listOf(item("t-item", vtodo("t", "t", attach("F", f), attach("H", h)))) }
+        var offline = true
+        client.stub {
+            onBlocking { fetchContent(any(), any()) } doSuspendableAnswer {
+                if (offline) throw IOException("connection reset during the download")
+                files[it.getArgument<String>(1)]?.let(::itemContent)
+            }
+        }
+        assertNotEquals("", sync())
+        offline = false
+        assertEquals("", sync())
+        assertEquals(setOf("F", "H"), linked(task.id))
+    }
+
+    /** REVIEW4 F4: an upload the server refuses (413 from a proxy) does not stop the other lists. */
+    @Test
+    fun refusedUploadDoesNotStopTheOtherLists() = runBlocking {
+        setUp()
+        store = EtebaseLiveTest.MemStore()
+        val collection2: Collection = mock {
+            on { uid } doReturn "col2"
+            on { stoken } doReturn "s1"
+            on { meta } doReturn listMeta
+        }
+        caldavDao.insert(CaldavCalendar(account = "a", uuid = "cal2", url = "col2", name = "list"))
+        val big = Task(title = "big").also { taskDao.createNew(it) }
+        caldavDao.insert(big, CaldavTask(task = big.id, calendar = "cal"), false)
+        linkFile(big.id, "B", data(4))
+        val other = Task(title = "other").also { taskDao.createNew(it) }
+        caldavDao.insert(other, CaldavTask(task = other.id, calendar = "cal2"), false)
+        dirtyDao.setDirty(listOf(big.id, other.id))
+        val pushed = item("pushed", vtodo("x", "other"))
+        val attachment = item("attachment", "")
+        client.stub {
+            onBlocking { getCollections() } doReturn listOf(collection, collection2)
+            onBlocking { createAttachment(any(), any()) } doReturn attachment
+            onBlocking { updateItem(any(), any(), any()) } doReturn pushed
+            onBlocking { uploadChanges(eq(collection), any()) } doSuspendableAnswer {
+                throw HttpException("413 Request Entity Too Large")
+            }
+        }
+        assertEquals("", sync())
+        verifyBlocking(client) { uploadChanges(eq(collection2), any()) }
+        assertTrue(dirtyDao.isDirty(caldavDao.getTask(big.id)!!.id) == true)
+        // the next sync pushes the task without the refused file, which the editor names; no retry before a day
+        assertEquals(mapOf("B" to ("B.bin" to Problem.NOT_UPLOADED)), EtebaseAttachments(db.taskAttachmentDao(), store).failures(big.id))
+        client.stub { onBlocking { uploadChanges(eq(collection), any()) } doReturn Unit }
+        assertEquals("", sync())
+        verifyBlocking(client) { uploadChanges(eq(collection), argThat { this == listOf(pushed) }) }
+        assertTrue(dirtyDao.isDirty(caldavDao.getTask(big.id)!!.id) != true)
+        verifyBlocking(client, org.mockito.kotlin.times(1)) { createAttachment(any(), any()) }
+    }
+
+    /** REVIEW4 F5: a download that fails is tried again by a later sync, also when nothing changed on the server. */
+    @Test
+    fun failedDownloadIsTriedAgain() = runBlocking {
+        setUp()
+        store = EtebaseLiveTest.MemStore()
+        val h = data(3)
+        page = { listOf(item("t-item", vtodo("t", "t", attach("H", h)))) }
+        var down = true
+        client.stub {
+            onBlocking { fetchContent(any(), any()) } doSuspendableAnswer {
+                if (down) throw ServerErrorException("500")
+                files[it.getArgument<String>(1)]?.let(::itemContent)
+            }
+        }
+        assertEquals("", sync())
+        val task = taskDao.getAll().single()
+        assertEquals(emptySet<String>(), linked(task.id))
+        down = false
+        page = { emptyList() }
+        setCurrentMillisFixed(currentTimeMillis() + 2 * 60 * 60 * 1000)
+        try {
+            assertEquals("", sync())
+        } finally {
+            setCurrentMillisSystem()
+        }
+        assertEquals(setOf("H"), linked(task.id))
     }
 }

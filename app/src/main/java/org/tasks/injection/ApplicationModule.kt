@@ -45,6 +45,7 @@ import org.tasks.billing.PlayPurchases
 import org.tasks.billing.StoreSubscriptionProvider
 import org.tasks.broadcast.RefreshBroadcaster
 import org.tasks.caldav.CaldavClientProvider
+import org.tasks.etebase.EtebaseAttachments
 import org.tasks.etebase.EtebaseClientProvider
 import org.tasks.etebase.EtebaseSynchronizer
 import org.tasks.caldav.TasksBasicAuth
@@ -387,8 +388,7 @@ class ApplicationModule {
         iCal: org.tasks.caldav.iCalendar,
         vtodoCache: VtodoCache,
         reporting: Reporting,
-        taskAttachmentDao: TaskAttachmentDao,
-        attachmentStore: AttachmentStore,
+        attachments: EtebaseAttachments,
     ): EtebaseSynchronizer = EtebaseSynchronizer(
         caldavDao = caldavDao,
         dirtyDao = dirtyDao,
@@ -398,9 +398,12 @@ class ApplicationModule {
         iCal = iCal,
         vtodoCache = vtodoCache,
         reporting = reporting,
-        taskAttachmentDao = taskAttachmentDao,
-        attachmentStore = attachmentStore,
+        attachments = attachments,
     )
+
+    @Provides
+    fun providesEtebaseAttachments(taskAttachmentDao: TaskAttachmentDao, attachmentStore: AttachmentStore) =
+        EtebaseAttachments(taskAttachmentDao, attachmentStore)
 
     @Provides
     fun providesAttachmentStore(@ApplicationContext context: Context, preferences: Preferences): AttachmentStore =

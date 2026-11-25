@@ -7,6 +7,7 @@ import androidx.room3.OnConflictStrategy
 import androidx.room3.Query
 import androidx.room3.Update
 import org.tasks.data.entity.Attachment
+import org.tasks.data.entity.MetadataTombstone
 import org.tasks.data.entity.TaskAttachment
 
 @Dao
@@ -40,4 +41,15 @@ interface TaskAttachmentDao {
 
     @Delete
     suspend fun delete(value: List<TaskAttachment>)
+
+    // Sync state of attachments (EteSync): rows of [category] whose key starts with [prefix]
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insertState(state: MetadataTombstone)
+
+    @Query("SELECT * FROM metadata_tombstone WHERE category = :category AND substr(entity_key, 1, length(:prefix)) = :prefix")
+    suspend fun getStates(category: String, prefix: String = ""): List<MetadataTombstone>
+
+    @Query("DELETE FROM metadata_tombstone WHERE category = :category AND substr(entity_key, 1, length(:prefix)) = :prefix")
+    suspend fun deleteStates(category: String, prefix: String)
 }

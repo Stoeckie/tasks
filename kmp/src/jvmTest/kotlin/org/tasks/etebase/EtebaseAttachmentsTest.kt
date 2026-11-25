@@ -21,7 +21,7 @@ import org.tasks.icalendar.ICalProperty
 import org.tasks.icalendar.VTodo
 import org.tasks.icalendar.parseVTodos
 import org.tasks.icalendar.serialize
-import java.util.Base64
+import org.tasks.etebase.EtebaseAttachments.Companion.Problem
 import kotlin.random.Random
 
 class EtebaseAttachmentsTest : DatabaseTest() {
@@ -59,12 +59,6 @@ class EtebaseAttachmentsTest : DatabaseTest() {
     private fun ref(data: ByteArray, uid: String, id: String) =
         reference(uid, id, sha256(data), "$id.png", "image/png", data.size.toLong()).also { server[uid] = data }
 
-    private fun inline(data: ByteArray) = ICalProperty(
-        "ATTACH",
-        Base64.getEncoder().encodeToString(data),
-        listOf("ENCODING" to "BASE64", "VALUE" to "BINARY", "X-FILENAME" to "foreign.png"),
-    )
-
     private fun vtodo(vararg properties: ICalProperty) =
         VTodo(uid = "t", unknownProperties = properties.toMutableList())
 
@@ -73,16 +67,22 @@ class EtebaseAttachmentsTest : DatabaseTest() {
             task = task,
             vtodo = vtodo,
             carried = carried,
-            create = { content -> created.add(fromItemContent(content)!!); "new${created.size}" },
+            create = { _, content -> created.add(fromItemContent(content)!!); "new${created.size}" },
             delete = { deleted.add(it) },
-            copy = { ref -> copied.add(ref.uid!!); "copy-${ref.uid}" },
+            copy = { ref -> copied.add(ref.uid); server[ref.uid]?.let(::itemContent) },
         )
 
-    private suspend fun pull(task: Long, remote: VTodo, base: VTodo?, dirty: Boolean = false) =
-        attachments.applyRemote(task, parse(remote), base?.let(::parse).orEmpty(), dirty) { ref ->
-            downloads.add(ref.uid!!)
+    private suspend fun pull(task: Long, remote: VTodo, base: VTodo?) =
+        attachments.applyRemote(task, parse(remote), base?.let(::parse).orEmpty()) { ref ->
+            downloads.add(ref.uid)
             server[ref.uid]
         }
+
+    /** What the editor does when the user removes an attachment. */
+    private suspend fun removeHere(task: Long, id: String) {
+        dao.delete(task, id)
+        attachments.removed(task, listOf(dao.getAttachment(id)!!))
+    }
 
     private suspend fun linked(task: Long) = dao.getAttachments(task).map { it.remoteId }.toSet()
 
@@ -110,11 +110,24 @@ class EtebaseAttachmentsTest : DatabaseTest() {
     }
 
     @Test
-    fun malformedOrOversizedInlineAttachmentsAreLeftAlone() {
-        assertNull(parse(ICalProperty("ATTACH", "not*base64", listOf("ENCODING" to "BASE64"))))
-        assertNull(parse(inline(bytes(MAX_BYTES + 1))))
+    fun attachmentsOfOtherClientsAreNotReferences() {
+        assertNull(parse(ICalProperty("ATTACH", "aGVsbG8=", listOf("ENCODING" to "BASE64", "VALUE" to "BINARY"))))
         assertNull(parse(ICalProperty("ATTACH", "https://example.com/a.png")))
-        assertEquals("foreign.png", parse(inline(bytes(10)))!!.name)
+        val withoutId = reference("u1", "f1", sha256(bytes(1)), "a.png", null, 1)
+            .let { it.copy(parameters = it.parameters.filter { (name, _) -> name != "X-TASKS-ID" }) }
+        assertNull(parse(withoutId))
+    }
+
+    @Test
+    fun inlineAttachmentOfAnotherClientStaysAsItIs() = runBlocking {
+        val task = newTask()
+        val inline = ICalProperty("ATTACH", "aGVsbG8=", listOf("ENCODING" to "BASE64", "VALUE" to "BINARY"))
+        val vtodo = vtodo(inline)
+        push(task, vtodo)
+        pull(task, vtodo, base = null)
+        assertEquals(listOf(inline), vtodo.unknownProperties)
+        assertEquals(emptyList<ByteArray>(), created)
+        assertEquals(emptySet<String>(), linked(task))
     }
 
     @Test
@@ -142,7 +155,7 @@ class EtebaseAttachmentsTest : DatabaseTest() {
         val data = bytes(1000)
         addFile(task, "f1", data)
         val vtodo = vtodo(ref(data, "u1", "f1"))
-        dao.delete(task, "f1") // removed in the editor; the file row stays
+        removeHere(task, "f1") // the file row stays
         push(task, vtodo)
         assertEquals(emptyList<AttachmentRef>(), parse(vtodo))
         assertEquals(listOf("u1"), deleted)
@@ -182,37 +195,61 @@ class EtebaseAttachmentsTest : DatabaseTest() {
     }
 
     @Test
-    fun validInlineAttachmentIsConvertedOnceAndMalformedStays() = runBlocking {
-        val task = newTask()
-        val data = bytes(5000)
-        val malformed = ICalProperty("ATTACH", "!!!!", listOf("ENCODING" to "BASE64", "VALUE" to "BINARY"))
-        val vtodo = vtodo(inline(data), malformed)
-        push(task, vtodo)
-        assertEquals(1, created.size)
-        assertArrayEquals(data, created[0])
-        val ref = parse(vtodo).single()
-        assertEquals("new1", ref.uid)
-        assertEquals("foreign.png", ref.name)
-        assertTrue(malformed in vtodo.unknownProperties)
-        push(task, vtodo)
-        assertEquals(1, created.size)
-    }
-
-    @Test
     fun moveCopiesWhatThisDeviceDoesNotHaveAndUploadsWhatItHas() = runBlocking {
         val task = newTask()
         val local = bytes(1000, 1)
         val remoteOnly = bytes(1000, 2)
         val removed = bytes(1000, 3)
         addFile(task, "local", local)
-        addFile(null, "removed", removed) // removed from the task before the move
+        addFile(task, "removed", removed)
+        removeHere(task, "removed") // removed from the task after the move
         val old = parse(vtodo(ref(local, "o1", "local"), ref(remoteOnly, "o2", "remote"), ref(removed, "o3", "removed")))
         val vtodo = vtodo()
         push(task, vtodo, carried = old)
         assertEquals(listOf("o2"), copied)
-        assertEquals(1, created.size)
+        assertEquals(2, created.size)
         assertArrayEquals(local, created[0])
-        assertEquals(setOf("copy-o2", "new1"), parse(vtodo).map { it.uid }.toSet())
+        assertArrayEquals(remoteOnly, created[1])
+        assertEquals(setOf("new1", "new2"), parse(vtodo).map { it.uid }.toSet())
+        assertEquals(setOf("local", "remote"), linked(task)) // the copy is kept here too
+        // pushed again while the old item is still there: nothing is carried twice
+        push(task, vtodo, carried = old)
+        assertEquals(1, copied.size)
+        assertEquals(2, created.size)
+        // the old item can go, with the items that the new list has copies of and the removed one
+        assertEquals(listOf("o1", "o2", "o3"), attachments.leftBehind(task, old, parse(vtodo)))
+    }
+
+    /** REVIEW4 F1: a reference added to the old item during the move is carried by the next push. */
+    @Test
+    fun referenceAddedToTheOldItemDuringAMoveIsCarried() = runBlocking {
+        val task = newTask()
+        val f = bytes(1000, 1)
+        val x = bytes(1000, 2)
+        addFile(task, "f", f)
+        val vtodo = vtodo()
+        push(task, vtodo, carried = parse(vtodo(ref(f, "o1", "f"))))
+        val old = parse(vtodo(ref(f, "o1", "f"), ref(x, "o2", "x")))
+        assertNull(attachments.leftBehind(task, old, parse(vtodo)))
+        push(task, vtodo, carried = old)
+        assertEquals(listOf("o2"), copied)
+        assertEquals(listOf("o1", "o2"), attachments.leftBehind(task, old, parse(vtodo)))
+    }
+
+    @Test
+    fun referenceThatCannotBeCopiedIsKeptAsItIs() = runBlocking {
+        val task = newTask()
+        val old = parse(vtodo(ref(bytes(1000), "o1", "f")))
+        val vtodo = vtodo()
+        attachments.applyLocal(
+            task = task,
+            vtodo = vtodo,
+            carried = old,
+            create = { _, _ -> error("nothing to upload") },
+            copy = { throw IllegalStateException("Got an invalid chunk index") },
+        )
+        assertEquals(listOf("o1"), parse(vtodo).map { it.uid })
+        assertEquals(emptyList<String>(), attachments.leftBehind(task, old, parse(vtodo))) // its item stays
     }
 
     @Test
@@ -225,15 +262,6 @@ class EtebaseAttachmentsTest : DatabaseTest() {
         assertEquals(setOf("f1"), linked(task))
         pull(task, remote, base = remote)
         assertEquals(1, downloads.size)
-    }
-
-    @Test
-    fun sameContentUnderAnotherIdIsNotDownloaded() = runBlocking {
-        val task = newTask()
-        val data = bytes(1000)
-        addFile(task, "mine", data)
-        pull(task, vtodo(ref(data, "u1", "theirs")), base = null)
-        assertEquals(emptyList<String>(), downloads)
     }
 
     @Test
@@ -263,7 +291,7 @@ class EtebaseAttachmentsTest : DatabaseTest() {
     fun localAdditionNotYetPushedIsKept() = runBlocking {
         val task = newTask()
         addFile(task, "f1", bytes(1000))
-        pull(task, vtodo(), base = vtodo(), dirty = true)
+        pull(task, vtodo(), base = vtodo())
         assertEquals(setOf("f1"), linked(task))
     }
 
@@ -271,9 +299,10 @@ class EtebaseAttachmentsTest : DatabaseTest() {
     fun localRemovalIsNotUndoneByAPull() = runBlocking {
         val task = newTask()
         val data = bytes(1000)
-        addFile(null, "f1", data)
+        addFile(task, "f1", data)
+        removeHere(task, "f1")
         val remote = vtodo(ref(data, "u1", "f1"))
-        pull(task, remote, base = remote, dirty = true)
+        pull(task, remote, base = remote)
         assertEquals(emptySet<String>(), linked(task))
         assertEquals(emptyList<String>(), downloads)
     }
@@ -283,9 +312,14 @@ class EtebaseAttachmentsTest : DatabaseTest() {
         // REVIEW3 M1: the push with the attachment arrived, its reply did not; the user removed it meanwhile
         val task = newTask()
         val data = bytes(1000)
-        addFile(null, "f1", data)
-        pull(task, vtodo(ref(data, "u1", "f1")), base = vtodo(), dirty = true)
+        addFile(task, "f1", data)
+        removeHere(task, "f1")
+        val remote = vtodo(ref(data, "u1", "f1"))
+        pull(task, remote, base = vtodo())
         assertEquals(emptyList<String>(), downloads)
+        assertEquals(emptySet<String>(), linked(task))
+        push(task, remote) // and the removal is pushed, it does not come back
+        assertEquals(listOf("u1"), deleted)
     }
 
     @Test
@@ -295,6 +329,7 @@ class EtebaseAttachmentsTest : DatabaseTest() {
         server.clear()
         pull(task, remote, base = null)
         assertEquals(emptySet<String>(), linked(task))
+        assertEquals(mapOf("f1" to ("f1.png" to Problem.NOT_DOWNLOADED)), attachments.failures(task))
         push(task, remote)
         assertEquals(1, parse(remote).size)
         assertEquals(emptyList<String>(), deleted)
@@ -332,5 +367,26 @@ class EtebaseAttachmentsTest : DatabaseTest() {
         assertEquals(listOf("u1"), downloads)
         assertEquals(setOf("f1"), linked(task))
         assertArrayEquals(data, store.files[dao.getAttachment("f1")!!.uri])
+    }
+
+    /** REVIEW4 F3: one unreadable reference does not stop the others, and a reference never linked here is not a removal. */
+    @Test
+    fun unreadableReferenceDoesNotStopTheOthersAndIsNotTakenForARemoval() = runBlocking {
+        val t1 = newTask()
+        val t2 = newTask()
+        val f = bytes(1000, 1)
+        addFile(t1, "F", f)
+        // t2 is a copy of t1 made on another device: an item of its own, the same file id
+        val remote = vtodo(ref(bytes(1000, 9), "uBad", "BAD"), ref(f, "uF2", "F"))
+        server.remove("uBad")
+        runCatching {
+            attachments.applyRemote(t2, parse(remote), emptyList()) { r ->
+                if (r.uid == "uBad") throw IllegalStateException("Got an invalid chunk index")
+                server[r.uid]
+            }
+        }
+        assertEquals(listOf("F"), dao.getAttachments(t2).map { it.remoteId })
+        push(t2, vtodo(*remote.unknownProperties.toTypedArray()))
+        assertEquals(emptyList<String>(), deleted)
     }
 }

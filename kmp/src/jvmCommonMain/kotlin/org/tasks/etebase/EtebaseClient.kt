@@ -9,9 +9,7 @@ import com.etebase.client.ItemManager
 import com.etebase.client.ItemMetadata
 import com.etebase.client.PrefetchOption
 import com.etebase.client.exceptions.ConnectionException
-import com.etebase.client.exceptions.HttpException
 import com.etebase.client.exceptions.NotFoundException
-import com.etebase.client.exceptions.PermissionDeniedException
 import com.etebase.client.exceptions.ServerErrorException
 import com.etebase.client.exceptions.TemporaryServerErrorException
 import com.etebase.client.exceptions.UnauthorizedException
@@ -63,10 +61,7 @@ class EtebaseClient(
         return cache.collectionList(collectionManager)
     }
 
-    /**
-     * Lists changed items. Attachment items come without content (they are fetched only when needed, see [fetch]);
-     * a page without them is listed again with content when more than one of its items is needed.
-     */
+    /** Lists changed items without content: a task item is fetched when it is new here, an attachment when needed. */
     suspend fun fetchItems(
         collection: Collection,
         calendar: CaldavCalendar,
@@ -75,11 +70,8 @@ class EtebaseClient(
         val itemManager = itemManager(collection)
         var stoken = calendar.ctag
         do {
-            val options = { FetchOptions().stoken(stoken).limit(MAX_FETCH) }
-            var page = withContext(Dispatchers.IO) { itemManager.list(options().prefetch(PrefetchOption.Medium)) }
-            val attachments = page.data.count { runCatching { it.isAttachment }.getOrDefault(false) }
-            if (attachments == 0 && page.data.count { !isCached(collection, it) } > 1) {
-                page = withContext(Dispatchers.IO) { itemManager.list(options()) }
+            val page = withContext(Dispatchers.IO) {
+                itemManager.list(FetchOptions().stoken(stoken).limit(MAX_FETCH).prefetch(PrefetchOption.Medium))
             }
             stoken = page.stoken
             callback(Pair(stoken, page.data.toList()))
@@ -95,13 +87,18 @@ class EtebaseClient(
         itemManager(collection).fetch(uid, null)
     }
 
-    /** The content of item [uid], or null when there is no such item. */
-    suspend fun fetchContent(collection: Collection, uid: String): ByteArray? =
+    /** The current revision of item [uid], with content, or null when there is no such item. */
+    suspend fun fetchOrNull(collection: Collection, uid: String): Item? =
         try {
-            val item = fetch(collection, uid)
-            item.content.also { check(item.uid == uid) } // the item stays reachable until its content is read
+            fetch(collection, uid)
         } catch (e: NotFoundException) {
             null
+        }
+
+    /** The content of item [uid], or null when there is no such item. */
+    suspend fun fetchContent(collection: Collection, uid: String): ByteArray? =
+        fetchOrNull(collection, uid)?.let { item ->
+            item.content.also { check(item.uid == uid) } // the item stays reachable until its content is read
         }
 
     /** A new attachment item, to be uploaded in the same batch as the VTODO that references it. */
@@ -175,10 +172,13 @@ class EtebaseClient(
             ?: return null
         return cache.itemGet(itemManager, collection.uid, objId)
                 ?.takeIf { !it.isDeleted }
-                ?.apply {
-                    meta = updateMtime(meta)
-                    delete()
-                }
+                ?.let(::delete)
+    }
+
+    /** [item] marked deleted, to be uploaded. */
+    fun delete(item: Item): Item = item.apply {
+        meta = updateMtime(meta)
+        delete()
     }
 
     private fun updateMtime(meta: ItemMetadata, mtime: Long = currentTimeMillis()): ItemMetadata =
@@ -251,11 +251,13 @@ class EtebaseClient(
         val Item.isAttachment: Boolean
             get() = meta.itemType == EtebaseAttachments.ITEM_TYPE
 
-        /** Errors that end a sync (it is tried again later), unlike errors caused by one item. */
+        /**
+         * Errors that end a sync (it is tried again later), unlike errors caused by one item, task or list (also any
+         * other HTTP status, such as 413 from a proxy for a large upload).
+         */
         val Throwable.isTransient: Boolean
-            get() = this is ConnectionException || this is HttpException || this is ServerErrorException ||
-                this is TemporaryServerErrorException || this is UnauthorizedException ||
-                this is PermissionDeniedException || this is java.io.IOException
+            get() = this is ConnectionException || this is ServerErrorException ||
+                this is TemporaryServerErrorException || this is UnauthorizedException || this is java.io.IOException
 
         private const val TYPE_TASKS = "etebase.vtodo"
         private const val MAX_FETCH = 30L

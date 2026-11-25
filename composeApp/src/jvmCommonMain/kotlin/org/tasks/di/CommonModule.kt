@@ -48,6 +48,7 @@ import org.tasks.data.entity.CaldavAccount.Companion.TYPE_TASKS
 import org.tasks.data.entity.Place
 import org.tasks.data.entity.Task
 import org.tasks.data.getOrCreateDefaultListFilter
+import org.tasks.etebase.EtebaseAttachments
 import org.tasks.etebase.EtebaseClientFactory
 import org.tasks.etebase.EtebaseClientProvider
 import org.tasks.etebase.EtebaseSynchronizer
@@ -186,6 +187,7 @@ val commonModule = module {
     factory<Encryption> { get<KeyStoreEncryption>() }
     factory<EtebaseClientFactory> { get<EtebaseClientProvider>() }
     factoryOf(::EtebaseSynchronizer)
+    factoryOf(::EtebaseAttachments)
     single<AttachmentStore> { AttachmentStore.None } // references stay on the server, untouched
     single { get<OkHttpClientFactory>().oauthClient(foreground = false) }
     single {

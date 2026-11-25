@@ -5,6 +5,7 @@ import com.etebase.client.Collection
 import com.etebase.client.Item
 import com.etebase.client.exceptions.ConflictException
 import com.etebase.client.exceptions.ConnectionException
+import com.etebase.client.exceptions.HttpException
 import com.etebase.client.exceptions.PermissionDeniedException
 import com.etebase.client.exceptions.ServerErrorException
 import com.etebase.client.exceptions.TemporaryServerErrorException
@@ -23,15 +24,14 @@ import org.tasks.caldav.iCalendar.Companion.fromVtodo
 import org.tasks.data.UUIDHelper
 import org.tasks.data.dao.CaldavDao
 import org.tasks.data.dao.DirtyDao
-import org.tasks.data.dao.TaskAttachmentDao
 import org.tasks.data.entity.CaldavAccount
+import org.tasks.data.entity.CaldavAccount.Companion.TYPE_ETEBASE
 import org.tasks.data.entity.CaldavCalendar
 import org.tasks.data.entity.CaldavTask
 import org.tasks.data.entity.Task
 import org.tasks.etebase.EtebaseAttachments.Companion.parse
 import org.tasks.etebase.EtebaseClient.Companion.isAttachment
 import org.tasks.etebase.EtebaseClient.Companion.isTransient
-import org.tasks.files.AttachmentStore
 import org.tasks.icalendar.VTodo
 import org.tasks.resources.getString
 import org.tasks.service.TaskDeleter
@@ -49,10 +49,8 @@ class EtebaseSynchronizer(
     private val iCal: iCalendar,
     private val vtodoCache: VtodoCache,
     private val reporting: Reporting,
-    taskAttachmentDao: TaskAttachmentDao,
-    attachmentStore: AttachmentStore,
+    private val attachments: EtebaseAttachments,
 ) {
-    private val attachments = EtebaseAttachments(taskAttachmentDao, attachmentStore)
 
     suspend fun sync(account: CaldavAccount, hasPro: Boolean) {
         Logger.d("EtebaseSynchronizer") { "Synchronizing $account" }
@@ -101,6 +99,8 @@ class EtebaseSynchronizer(
         for (calendar in caldavDao.findDeletedCalendars(account.uuid!!, uids)) {
             taskDeleter.delete(calendar)
         }
+        // tasks with an upload that the server refused are tried again after a while
+        dirtyDao.setDirty(attachments.uploadsDue(), listOf(TYPE_ETEBASE))
         for (collection in collections) {
             val uid = collection.uid
             var calendar = caldavDao.getCalendarByUrl(account.uuid!!, uid)
@@ -127,8 +127,14 @@ class EtebaseSynchronizer(
                 caldavDao.update(calendar)
                 refreshBroadcaster.broadcastRefresh()
             }
-            fetchChanges(account, client, calendar, collection)
-            pushLocalChanges(account, client, calendar, collection)
+            try {
+                fetchChanges(account, client, calendar, collection)
+                pushLocalChanges(account, client, calendar, collection)
+            } catch (e: Exception) {
+                if (e.isTransient) throw e
+                // one list never stops the sync of the others
+                Logger.e("EtebaseSynchronizer", e) { "Not synchronized: ${calendar.name}" }
+            }
         }
     }
 
@@ -150,6 +156,7 @@ class EtebaseSynchronizer(
         caldavCalendar: CaldavCalendar,
         collection: Collection
     ) {
+        retryDownloads(client, caldavCalendar, collection)
         if (caldavCalendar.ctag?.equals(collection.stoken) == true) {
             Logger.d("EtebaseSynchronizer") { "${caldavCalendar.name} up to date" }
             return
@@ -207,21 +214,34 @@ class EtebaseSynchronizer(
         }
         caldavTask?.obj = item.uid
         val base = caldavTask?.let { vtodoCache.getVtodo(caldavCalendar, it) }?.let { fromVtodo(it) }
-        val dirty = caldavTask != null && dirtyDao.isDirty(caldavTask.id) == true
-        iCal.fromVtodo(account, caldavCalendar, caldavTask, remote, vtodo, item.uid, null)
+        iCal.fromVtodo(account, caldavCalendar, caldavTask, remote, vtodo, item.uid, null, cacheVtodo = false)
         caldavDao.getTaskByRemoteId(caldavCalendar.uuid!!, remoteId)
             ?.takeIf { !it.isDeleted() }
             ?.let { saved ->
-                attachments.applyRemote(saved.task, parse(remote), base?.let(::parse).orEmpty(), dirty) {
-                    try {
-                        it.uid?.let { uid -> client.fetchContent(collection, uid) }
-                            ?.let(EtebaseAttachments::fromItemContent)
-                    } catch (e: ServerErrorException) {
-                        null // the server cannot give this one (it answers 500 for an unknown uid)
-                    }
-                }
+                attachments.applyRemote(saved.task, parse(remote), base?.let(::parse).orEmpty(), download(client, collection))
+                // the new base only once the attachments are applied: a download that is cut off leaves the old one
+                vtodoCache.putVtodo(caldavCalendar, saved, vtodo)
             }
         return item
+    }
+
+    private fun download(client: EtebaseClient, collection: Collection): suspend (AttachmentRef) -> ByteArray? = {
+        try {
+            client.fetchContent(collection, it.uid)?.let(EtebaseAttachments::fromItemContent)
+        } catch (e: ServerErrorException) {
+            null // the server cannot give this one (it answers 500 for an unknown uid); tried again later
+        }
+    }
+
+    /** Downloads that failed in [caldavCalendar] are tried again, also when nothing changed on the server. */
+    private suspend fun retryDownloads(client: EtebaseClient, caldavCalendar: CaldavCalendar, collection: Collection) {
+        for (task in attachments.downloadsDue()) {
+            val rows = caldavDao.getTasks(task)
+            if (rows.none { !it.isDeleted() }) attachments.forget(task)
+            val caldavTask = rows.firstOrNull { it.calendar == caldavCalendar.uuid && !it.isDeleted() } ?: continue
+            val refs = vtodoCache.getVtodo(caldavCalendar, caldavTask)?.let { fromVtodo(it) }?.let(::parse) ?: continue
+            attachments.applyRemote(task, refs, refs, download(client, collection))
+        }
     }
 
     private class Change(
@@ -230,6 +250,7 @@ class EtebaseSynchronizer(
         val vtodo: String? = null,
         val attachments: List<Item> = emptyList(),
         val dirtyVersion: Long? = null,
+        val uploads: List<String> = emptyList(),
     )
 
     private suspend fun pushLocalChanges(
@@ -243,14 +264,18 @@ class EtebaseSynchronizer(
             if (isMovePending(account, caldavTask)) {
                 continue // the old item stays until the new list has the task and its attachments
             }
-            client.deleteItem(collection, caldavTask)
-                ?.let { changes.add(Change(it, caldavTask)) }
-                ?: caldavDao.delete(caldavTask)
+            try {
+                movedAway(account, client, collection, caldavTask)?.let(changes::add)
+            } catch (e: Exception) {
+                if (e.isTransient) throw e
+                Logger.e("EtebaseSynchronizer", e) { "Old item kept: task ${caldavTask.task}" }
+            }
         }
         for (toPush in dirtyDao.getTasksToPush(caldavCalendar.uuid!!)) {
             val caldavTask = caldavDao.getCaldavTaskById(toPush.caldavTaskId) ?: continue
+            var change: Change? = null
             try {
-                val change = push(account, client, caldavCalendar, collection, toPush.task, caldavTask, toPush.dirtyVersion)
+                change = push(account, client, caldavCalendar, collection, toPush.task, caldavTask, toPush.dirtyVersion)
                 when {
                     change == null -> Unit
                     change.attachments.any { !it.isDeleted } -> upload(client, collection, caldavCalendar, listOf(change))
@@ -258,6 +283,10 @@ class EtebaseSynchronizer(
                 }
             } catch (e: Exception) {
                 if (e.isTransient) throw e
+                if (e is HttpException) {
+                    // e.g. 413 from a proxy: pushed without these files next time, shown in the editor
+                    change?.uploads?.let { attachments.notUploaded(toPush.task.id, it) }
+                }
                 // one task never stops the push of the others; it stays dirty
                 Logger.e("EtebaseSynchronizer", e) { "Not pushed: task ${toPush.task.id}" }
             }
@@ -282,34 +311,77 @@ class EtebaseSynchronizer(
                     taskDeleter.delete(task)
                     return null
                 }
-            vtodo?.let { fromVtodo(it) }?.let(::parse)?.mapNotNull { it.uid }?.forEach { uid ->
+            vtodo?.let { fromVtodo(it) }?.let(::parse)?.map { it.uid }?.forEach { uid ->
                 client.deleteAttachment(collection, uid)?.let(items::add)
             }
             return Change(item, caldavTask, attachments = items)
         }
         val cached = vtodoCache.getVtodo(caldavCalendar, caldavTask)
         val model = cached?.let { fromVtodo(it) } ?: VTodo()
-        val moved = if (cached == null) movedFrom(account, client, task) else null
+        // until the old item of a moved task is gone, what it references is carried (also what was added meanwhile)
+        val moved = movedFrom(account, client, task)
+        val uploads = ArrayList<String>()
         attachments.applyLocal(
             task = task.id,
             vtodo = model,
             carried = moved?.second.orEmpty(),
-            create = { content -> client.createAttachment(collection, content).also(items::add).uid },
-            delete = { uid -> client.deleteAttachment(collection, uid)?.let(items::add) },
-            copy = { ref ->
-                client.fetchContent(moved!!.first, ref.uid!!)?.let { content ->
-                    client.createAttachment(collection, content).also(items::add).uid
-                }
+            create = { id, content ->
+                uploads.add(id)
+                client.createAttachment(collection, content).also(items::add).uid
             },
+            delete = { uid -> client.deleteAttachment(collection, uid)?.let(items::add) },
+            copy = { ref -> client.fetchContent(moved!!.first, ref.uid) },
         )
         val vtodo = iCal.toVtodo(account, caldavTask, task, model)
         val item = client.updateItem(collection, caldavTask, vtodo)
-        return Change(item, caldavTask, vtodo.decodeToString(), items, dirtyVersion)
+        return Change(item, caldavTask, vtodo.decodeToString(), items, dirtyVersion, uploads)
     }
 
     /**
-     * The list a new task of this list was moved from on this device (same account), with the attachments it had
-     * there, so that they can be carried over.
+     * The deletion of the old item of a task that was moved from this list, with the attachment items that the new
+     * list has copies of. When the old item references an attachment that the new one lacks (added on another device
+     * during the move), the task is pushed to the new list again first, and the old item stays until then.
+     */
+    private suspend fun movedAway(
+        account: CaldavAccount,
+        client: EtebaseClient,
+        collection: Collection,
+        caldavTask: CaldavTask,
+    ): Change? {
+        val old = caldavTask.obj?.let { client.fetchOrNull(collection, it) }?.takeIf { !it.isDeleted }
+            ?: run {
+                caldavDao.delete(caldavTask)
+                return null
+            }
+        // an old item that cannot be read has nothing to carry
+        val refs = runCatching { fromVtodo(old.contentString) }.getOrNull()?.let(::parse).orEmpty()
+        val leftBehind = when (val moved = movedTo(account, caldavTask)) {
+            null -> emptyList() // another account or kind of list: the old items stay
+            else -> attachments.leftBehind(caldavTask.task, refs, moved)
+        }
+        if (leftBehind == null) {
+            dirtyDao.setDirty(listOf(caldavTask.task), listOf(TYPE_ETEBASE))
+            return null
+        }
+        return Change(
+            client.delete(old),
+            caldavTask,
+            attachments = leftBehind.mapNotNull { client.deleteAttachment(collection, it) },
+        )
+    }
+
+    /** The references of the task of a moved [caldavTask] in another list of [account], or null if it has none. */
+    private suspend fun movedTo(account: CaldavAccount, caldavTask: CaldavTask): List<AttachmentRef>? {
+        for (row in caldavDao.getTasks(caldavTask.task).filter { !it.isDeleted() }) {
+            val calendar = caldavDao.getCalendar(row.calendar!!)?.takeIf { it.account == account.uuid } ?: continue
+            return vtodoCache.getVtodo(calendar, row)?.let { fromVtodo(it) }?.let(::parse).orEmpty()
+        }
+        return null
+    }
+
+    /**
+     * The list a task of this list was moved from on this device (same account), with the attachments its old item
+     * references now, so that they can be carried over.
      */
     private suspend fun movedFrom(
         account: CaldavAccount,
@@ -351,12 +423,20 @@ class EtebaseSynchronizer(
         for (change in changes) {
             val caldavTask = change.caldavTask
             when {
-                change.item.isDeleted ->
-                    if (caldavTask.isDeleted()) caldavDao.delete(caldavTask) else taskDeleter.delete(caldavTask.task)
+                change.item.isDeleted && caldavTask.isDeleted() -> caldavDao.delete(caldavTask)
+                change.item.isDeleted -> {
+                    taskDeleter.delete(caldavTask.task)
+                    attachments.forget(caldavTask.task)
+                }
                 else -> {
                     vtodoCache.putVtodo(caldavCalendar, caldavTask, change.vtodo)
                     caldavDao.update(caldavTask)
                     change.dirtyVersion?.let { dirtyDao.markPushed(caldavTask.id, it) }
+                    attachments.pushed(
+                        task = caldavTask.task,
+                        uploaded = change.uploads,
+                        removalsDone = caldavDao.getTasks(caldavTask.task).none { it.isDeleted() },
+                    )
                 }
             }
         }

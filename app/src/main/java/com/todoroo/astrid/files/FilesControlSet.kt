@@ -41,6 +41,7 @@ class FilesControlSet : TaskEditControlFragment() {
     @Inject lateinit var taskAttachmentDao: TaskAttachmentDao
     @Inject lateinit var preferences: Preferences
     @Inject lateinit var attachmentStore: AttachmentStore
+    @Inject lateinit var etebaseAttachments: EtebaseAttachments
 
     @Composable
     override fun Content() {
@@ -53,8 +54,8 @@ class FilesControlSet : TaskEditControlFragment() {
             }
         }
         val context = LocalContext.current
-        val problems by produceState(emptyMap(), viewState.attachments, viewState.list) {
-            value = problems(viewState.list, viewState.attachments)
+        val problems by produceState(emptyList(), viewState.attachments, viewState.list) {
+            value = problems(viewState.task.id, viewState.list, viewState.attachments)
         }
         AttachmentRow(
             attachments = viewState.attachments,
@@ -78,28 +79,42 @@ class FilesControlSet : TaskEditControlFragment() {
         )
     }
 
-    /** Why EteSync does not synchronize an attachment, by its uuid (same limits as the sync). */
-    private suspend fun problems(list: CaldavFilter, attachments: Collection<TaskAttachment>): Map<String, String> {
-        if (!list.account.isEtebaseAccount) return emptyMap()
+    /** Why EteSync does not synchronize attachments of a task: names and reasons (same limits as the sync). */
+    private suspend fun problems(
+        task: Long,
+        list: CaldavFilter,
+        attachments: Collection<TaskAttachment>,
+    ): List<Pair<String, String>> {
+        if (!list.account.isEtebaseAccount) return emptyList()
+        val failures = etebaseAttachments.failures(task)
         var count = 0
         var bytes = 0L
-        return attachments.mapNotNull { attachment ->
-            val size = attachmentStore.size(attachment.uri) ?: return@mapNotNull null
-            when (EtebaseAttachments.problem(size, count, bytes)) {
-                null -> {
-                    count++
-                    bytes += size
-                    null
-                }
-                Problem.TOO_LARGE ->
-                    attachment.remoteId to getString(R.string.attachment_not_synced_too_large, MIB_LIMIT)
-                Problem.TASK_LIMIT -> attachment.remoteId to getString(
-                    R.string.attachment_not_synced_task_limit,
-                    EtebaseAttachments.MAX_PER_TASK,
-                    (EtebaseAttachments.MAX_TASK_BYTES / MIB).toInt(),
-                )
+        val limits = attachments.mapNotNull { attachment ->
+            val size = attachmentStore.size(attachment.uri)
+            val problem = size?.let { EtebaseAttachments.problem(it, count, bytes) }
+            if (size != null && problem == null) {
+                count++
+                bytes += size
             }
-        }.toMap()
+            (problem ?: failures[attachment.remoteId]?.second)?.let { attachment.name to it }
+        }
+        // attachments that never arrived here have no row, only their failure
+        val missing = failures
+            .filterKeys { id -> attachments.none { it.remoteId == id } }
+            .values
+            .toList()
+        return (limits + missing).map { (name, problem) -> name to message(problem) }
+    }
+
+    private fun message(problem: Problem) = when (problem) {
+        Problem.TOO_LARGE -> getString(R.string.attachment_not_synced_too_large, MIB_LIMIT)
+        Problem.TASK_LIMIT -> getString(
+            R.string.attachment_not_synced_task_limit,
+            EtebaseAttachments.MAX_PER_TASK,
+            (EtebaseAttachments.MAX_TASK_BYTES / MIB).toInt(),
+        )
+        Problem.NOT_DOWNLOADED -> getString(R.string.attachment_not_synced_not_downloaded)
+        Problem.NOT_UPLOADED -> getString(R.string.attachment_not_synced_refused)
     }
 
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
