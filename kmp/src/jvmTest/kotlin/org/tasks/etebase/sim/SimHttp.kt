@@ -45,6 +45,8 @@ class Counters {
     val downloaded = LinkedHashMap<String, Int>()
     /** Uploads the server applied whose reply the device did not get (lost, or the app was killed). */
     var lostUploads = 0
+    /** Content bytes sent in transactions that the server or a proxy refused. */
+    var refusedBytes = 0L
 }
 
 class SimHttp(
@@ -67,6 +69,10 @@ class SimHttp(
     val downloaded get() = counters.downloaded
     /** Optional filter of listed collections (live server: only the collections of this run). */
     var collectionFilter: ((String) -> Boolean)? = null
+    /** Collections this device may only read (a read-only member): transactions answer 403. */
+    var readOnly: Set<String> = emptySet()
+    /** A proxy that refuses request bodies above this size (413), every time. */
+    var proxyLimit: Int? = null
 
     override fun get(url: String, auth_token: String?, response: Response) = call("GET", url, auth_token, null, response)
     override fun post(url: String, auth_token: String?, body: ByteArray, response: Response) = call("POST", url, auth_token, body, response)
@@ -84,6 +90,14 @@ class SimHttp(
             hooks.remove(hook)
             trace("  hook before $request")
             hook.second()
+        }
+        if (request.isTransaction && (proxyLimit?.let { (body?.size ?: 0) > it } == true)) {
+            counters.refusedBytes += contentBytes(request)
+            return response.reset_ok(Msgpack.encode(mapOf("detail" to "Request Entity Too Large")), 413)
+        }
+        if (request.isTransaction && readOnly.any { request.path.startsWith("collection/$it/") }) {
+            counters.refusedBytes += contentBytes(request)
+            return response.reset_ok(Msgpack.encode(mapOf("code" to "no_write_access", "detail" to "You need write access to write to this collection")), 403)
         }
         val fault = faults.firstOrNull { it.where(request) }?.also { faults.remove(it) }
         fault?.let { trace("  fault $it: $request") }
@@ -111,6 +125,15 @@ class SimHttp(
         }
         if (!request.isTransaction) account(request, status, reply)
         response.reset_ok(filter(request, status, reply), status)
+    }
+
+    private fun contentBytes(request: Request): Long {
+        @Suppress("UNCHECKED_CAST")
+        val items = (Msgpack.decode(request.body!!) as Map<*, *>)["items"] as List<Map<*, *>>
+        return items.sumOf { item ->
+            @Suppress("UNCHECKED_CAST")
+            ((item["content"] as Map<*, *>)["chunks"] as List<List<Any?>>).sumOf { (it.getOrNull(1) as ByteArray?)?.size?.toLong() ?: 0 }
+        }
     }
 
     private fun kill(response: Response) {

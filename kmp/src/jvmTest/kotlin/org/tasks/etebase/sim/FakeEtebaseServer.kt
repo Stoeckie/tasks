@@ -189,6 +189,12 @@ class FakeEtebaseServer : Transport {
         @Suppress("UNCHECKED_CAST")
         val deps = body["deps"] as List<Map<*, *>>?
         val conflicts = ArrayList<String>()
+        // the real server applies items one by one, so a second revision of an item in the same request has a stale
+        // etag: 409 for the whole request
+        val uids = items.map { it["uid"] as String }
+        if (uids.size != uids.toSet().size) {
+            throw HttpError(409, "item_failed", "Items failed to validate: same item twice")
+        }
         deps?.forEach { dep ->
             val item = collections.values.firstNotNullOfOrNull { it.items[dep["uid"]] }
                 ?: throw HttpError(500, "server_error", "Server error")

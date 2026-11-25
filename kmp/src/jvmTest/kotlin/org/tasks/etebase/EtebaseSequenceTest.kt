@@ -5,6 +5,7 @@ import co.touchlab.kermit.Severity
 import org.junit.After
 import org.junit.Assume.assumeTrue
 import org.junit.Before
+import org.junit.Ignore
 import org.junit.Test
 import org.tasks.etebase.sim.SequenceDriver
 import java.io.File
@@ -48,6 +49,17 @@ class EtebaseSequenceTest {
     /** Seeds that failed once, kept as regression tests. */
     @Test
     fun regressions() = run(SequenceDriver(), REGRESSIONS, keepGoing = false)
+
+    /**
+     * Seeds that still fail because of accepted limitations of the move handling (REVIEW6 M2): a task duplicated after
+     * a move there and back while another device's sync ended early (111934), a device that diverges for good when it
+     * moves a task again before the move it followed was fetched (119596), two concurrent moves where one copy keeps an
+     * attachment the other device removed (112187; 107464 is the same case, but whether it shows depends on timing).
+     * Nothing is lost in any of them.
+     */
+    @Ignore("known limitations, see KNOWN_FAILING")
+    @Test
+    fun knownLimitations() = run(SequenceDriver(), KNOWN_FAILING, keepGoing = true)
 
     @Test
     fun liveServer() {
@@ -111,5 +123,8 @@ class EtebaseSequenceTest {
             5197L, 5247L, 5251L, 5330L, 5400L, 5461L, 5463L, 5493L, 5657L, 5845L, 5855L, 5869L, 5984L, 9367L, 9430L,
             9495L, 11208L, 14581L, 19778L, 22753L, 23327L, 25432L, 29870L,
         )
+
+        /** Seeds of REVIEW6 that fail because of a known limitation (see [knownLimitations]). */
+        private val KNOWN_FAILING = listOf(107464L, 111934L, 112187L, 119596L)
     }
 }

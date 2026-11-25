@@ -121,6 +121,9 @@ class SimDevice(
     private lateinit var dir: File
     private lateinit var parts: Parts
     var collectionFilter: ((String) -> Boolean)? = null
+    /** Network settings that survive restarts (see SimHttp). */
+    var readOnly: Set<String> = emptySet()
+    var proxyLimit: Int? = null
     val exceptions = ArrayList<Throwable>()
 
     val caldavDao get() = db.caldavDao()
@@ -164,7 +167,9 @@ class SimDevice(
     /** The app starts again: everything is rebuilt from the database and the files. */
     fun restart() {
         val offline = ::http.isInitialized && http.offline
-        http = SimHttp(transport, { trace("$name$it") }, counters).also { it.offline = offline; it.collectionFilter = collectionFilter }
+        http = SimHttp(transport, { trace("$name$it") }, counters).also {
+            it.offline = offline; it.collectionFilter = collectionFilter; it.readOnly = readOnly; it.proxyLimit = proxyLimit
+        }
         parts = Parts()
     }
 
@@ -173,7 +178,33 @@ class SimDevice(
         db.close()
     }
 
-    private val cacheUser get() = "sim-${root.name}-$name-$life"
+    private var logins = 0
+    private val cacheUser get() = "sim-${root.name}-$name-$life-$logins"
+
+    /** The user removes the account (as the app does: its tasks go) and logs in again; files stay. */
+    fun logout() = runBlocking {
+        val account = caldavDao.getAccountByUuid(accountUuid)!!
+        parts.taskDeleter.delete(account)
+        runCatching { EtebaseLocalCache.clear(cacheDir.absolutePath, cacheUser) }
+        logins++
+        caldavDao.insert(
+            CaldavAccount(
+                uuid = accountUuid, accountType = CaldavAccount.TYPE_ETEBASE, url = "http://sim/", username = name,
+                password = "x",
+            )
+        )
+        restart()
+    }
+
+    /** A new subtask of [parent], in its list, as the app creates one. */
+    suspend fun newSubtask(parent: Long, title: String): Task? {
+        val parentRow = caldavDao.getTask(parent) ?: return null
+        val task = Task(title = title, parent = parent)
+        taskDao.createNew(task)
+        caldavDao.insert(task, CaldavTask(task = task.id, calendar = parentRow.calendar, remoteParent = parentRow.remoteId), false)
+        dirtyDao.setDirty(listOf(task.id))
+        return task
+    }
 
     private inner class Parts {
         val vtodoCache = VtodoCache(caldavDao, FileStorage(File(dir, "vtodo").absolutePath))
