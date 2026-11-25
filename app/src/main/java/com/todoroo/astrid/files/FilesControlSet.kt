@@ -10,6 +10,8 @@ import android.content.Intent
 import android.net.Uri
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.produceState
 import androidx.compose.ui.platform.LocalContext
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.lifecycleScope
@@ -23,8 +25,12 @@ import org.tasks.compose.edit.AttachmentRow
 import org.tasks.data.dao.TaskAttachmentDao
 import org.tasks.data.entity.TaskAttachment
 import org.tasks.dialogs.AddAttachmentDialog
+import org.tasks.etebase.EtebaseAttachments
+import org.tasks.etebase.EtebaseAttachments.Companion.Problem
 import org.tasks.extensions.Context.takePersistableUriPermission
+import org.tasks.files.AttachmentStore
 import org.tasks.files.FileHelper
+import org.tasks.filters.CaldavFilter
 import org.tasks.preferences.Preferences
 import org.tasks.ui.TaskEditControlFragment
 import timber.log.Timber
@@ -34,6 +40,7 @@ import javax.inject.Inject
 class FilesControlSet : TaskEditControlFragment() {
     @Inject lateinit var taskAttachmentDao: TaskAttachmentDao
     @Inject lateinit var preferences: Preferences
+    @Inject lateinit var attachmentStore: AttachmentStore
 
     @Composable
     override fun Content() {
@@ -46,8 +53,12 @@ class FilesControlSet : TaskEditControlFragment() {
             }
         }
         val context = LocalContext.current
+        val problems by produceState(emptyMap(), viewState.attachments, viewState.list) {
+            value = problems(viewState.list, viewState.attachments)
+        }
         AttachmentRow(
             attachments = viewState.attachments,
+            problems = problems,
             openAttachment = {
                 Timber.d("Clicked open $it")
                 FileHelper.startActionView(
@@ -65,6 +76,30 @@ class FilesControlSet : TaskEditControlFragment() {
                     .show(parentFragmentManager, FRAG_TAG_ADD_ATTACHMENT_DIALOG)
             },
         )
+    }
+
+    /** Why EteSync does not synchronize an attachment, by its uuid (same limits as the sync). */
+    private suspend fun problems(list: CaldavFilter, attachments: Collection<TaskAttachment>): Map<String, String> {
+        if (!list.account.isEtebaseAccount) return emptyMap()
+        var count = 0
+        var bytes = 0L
+        return attachments.mapNotNull { attachment ->
+            val size = attachmentStore.size(attachment.uri) ?: return@mapNotNull null
+            when (EtebaseAttachments.problem(size, count, bytes)) {
+                null -> {
+                    count++
+                    bytes += size
+                    null
+                }
+                Problem.TOO_LARGE ->
+                    attachment.remoteId to getString(R.string.attachment_not_synced_too_large, MIB_LIMIT)
+                Problem.TASK_LIMIT -> attachment.remoteId to getString(
+                    R.string.attachment_not_synced_task_limit,
+                    EtebaseAttachments.MAX_PER_TASK,
+                    (EtebaseAttachments.MAX_TASK_BYTES / MIB).toInt(),
+                )
+            }
+        }.toMap()
     }
 
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
@@ -126,5 +161,7 @@ class FilesControlSet : TaskEditControlFragment() {
     companion object {
         val TAG = R.string.TEA_ctrl_files_pref
         private const val FRAG_TAG_ADD_ATTACHMENT_DIALOG = "frag_tag_add_attachment_dialog"
+        private const val MIB = 1024 * 1024
+        private const val MIB_LIMIT = EtebaseAttachments.MAX_BYTES / MIB
     }
 }

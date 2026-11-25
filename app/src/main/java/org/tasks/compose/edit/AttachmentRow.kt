@@ -179,6 +179,30 @@ fun AttachmentRow(
     )
 }
 
+/** [AttachmentRow], with why EteSync does not synchronize an attachment ([problems] by its uuid) below it. */
+@Composable
+fun AttachmentRow(
+    attachments: ImmutableSet<TaskAttachment>,
+    problems: Map<String, String>,
+    openAttachment: (TaskAttachment) -> Unit,
+    deleteAttachment: (TaskAttachment) -> Unit,
+    addAttachment: () -> Unit,
+) {
+    Column {
+        AttachmentRow(attachments, openAttachment, deleteAttachment, addAttachment)
+        attachments.forEach { attachment ->
+            problems[attachment.remoteId]?.let { problem ->
+                Text(
+                    text = stringResource(R.string.attachment_not_synced, attachment.name, problem),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.error,
+                    modifier = Modifier.padding(start = 72.dp, end = 16.dp, bottom = 8.dp),
+                )
+            }
+        }
+    }
+}
+
 @Composable
 fun NoThumbnail(
     filename: String,
