@@ -101,7 +101,7 @@ class TaskDuplicator @Inject constructor(
             alarmDao.insert(alarms.map { it.copy(id = 0, task = clone.id) })
         }
         gcalHelper.createTaskEventIfEnabled(clone)
-        taskSaver.save(clone, null) // TODO: delete me
+        // linked before the save, so that a sync never pushes the copy without them
         taskAttachmentDao
             .getAttachmentsForTask(task.id)
             .map {
@@ -112,6 +112,7 @@ class TaskDuplicator @Inject constructor(
                 )
             }
             .let { taskAttachmentDao.insert(it) }
+        taskSaver.save(clone, null) // TODO: delete me
         getDirectChildren(task.id).forEach { subtask ->
             clone(subtask, newId)
         }

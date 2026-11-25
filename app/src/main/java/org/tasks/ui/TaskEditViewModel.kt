@@ -65,6 +65,7 @@ import org.tasks.data.entity.CaldavTask
 import org.tasks.data.entity.SYNC_ALARMS
 import org.tasks.data.entity.SYNC_LOCATION
 import org.tasks.data.entity.SYNC_TAGS
+import org.tasks.data.entity.SYNC_ATTACHMENTS
 import org.tasks.data.entity.TagData
 import org.tasks.data.entity.Task
 import org.tasks.data.entity.Task.Companion.NOTIFY_MODE_FIVE
@@ -380,6 +381,28 @@ class TaskEditViewModel @Inject constructor(
             task.putTransitory(SYNC_ALARMS, true)
         }
 
+        if (originalState.value.attachments != _viewState.value.attachments) {
+            originalState.value.attachments
+                .minus(_viewState.value.attachments)
+                .map { it.remoteId }
+                .let { taskAttachmentDao.delete(task.id, it) }
+            _viewState.value.attachments
+                .minus(originalState.value.attachments)
+                .map {
+                    Attachment(
+                        task = task.id,
+                        fileId = it.id!!,
+                        attachmentUid = it.remoteId,
+                    )
+                }
+                .let { taskAttachmentDao.insert(it) }
+            // saved before the task so that a sync never sees the task without them
+            if (_viewState.value.list.account.isEtebaseAccount) {
+                // only EteSync syncs attachments; elsewhere this would just bump the modification date
+                task.putTransitory(SYNC_ATTACHMENTS, true)
+            }
+        }
+
         taskSaver.save(task, original)
         val selectedList = _viewState.value.list
         if (isNew || originalState.value.list != selectedList) {
@@ -429,23 +452,6 @@ class TaskEditViewModel @Inject constructor(
                     )
                 }
             }
-        }
-
-        if (originalState.value.attachments != _viewState.value.attachments) {
-            originalState.value.attachments
-                .minus(_viewState.value.attachments)
-                .map { it.remoteId }
-                .let { taskAttachmentDao.delete(task.id, it) }
-            _viewState.value.attachments
-                .minus(originalState.value.attachments)
-                .map {
-                    Attachment(
-                        task = task.id,
-                        fileId = it.id!!,
-                        attachmentUid = it.remoteId,
-                    )
-                }
-                .let { taskAttachmentDao.insert(it) }
         }
 
         if (task.isCompleted != _viewState.value.isCompleted) {

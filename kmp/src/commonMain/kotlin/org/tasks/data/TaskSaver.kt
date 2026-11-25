@@ -12,6 +12,7 @@ import org.tasks.data.entity.CaldavAccount.Companion.TYPE_MICROSOFT
 import org.tasks.data.entity.SUPPRESS_SYNC
 import org.tasks.data.entity.SyncTrait
 import org.tasks.data.entity.SYNC_ALARMS
+import org.tasks.data.entity.SYNC_ATTACHMENTS
 import org.tasks.data.entity.SYNC_LOCATION
 import org.tasks.data.entity.SYNC_TAGS
 import org.tasks.data.entity.Task
@@ -67,7 +68,8 @@ class TaskSaver(
         val transitoryChanged = !isMicrosoftSubtask &&
                 ((SyncTrait.TAGS in traits && task.checkTransitory(SYNC_TAGS)) ||
                         (SyncTrait.ALARMS in traits && task.checkTransitory(SYNC_ALARMS)) ||
-                        (SyncTrait.LOCATION in traits && task.checkTransitory(SYNC_LOCATION)))
+                        (SyncTrait.LOCATION in traits && task.checkTransitory(SYNC_LOCATION)) ||
+                        (SyncTrait.ATTACHMENTS in traits && task.checkTransitory(SYNC_ATTACHMENTS)))
         if (transitoryChanged) {
             return true
         }

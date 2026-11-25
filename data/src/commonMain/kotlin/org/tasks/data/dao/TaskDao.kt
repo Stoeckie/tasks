@@ -19,6 +19,7 @@ import org.tasks.data.entity.CaldavAccount.Companion.TYPES_CALDAV
 import org.tasks.data.entity.SYNC_ALARMS
 import org.tasks.data.entity.SYNC_LOCATION
 import org.tasks.data.entity.SYNC_TAGS
+import org.tasks.data.entity.SYNC_ATTACHMENTS
 import org.tasks.data.entity.Task
 import org.tasks.data.sql.Criterion
 import org.tasks.data.sql.Functions
@@ -220,7 +221,7 @@ FROM recursive_tasks
                 task.order = it.order
             }
         }
-        if (updateTimestamp && (!task.insignificantChange(original) || task.checkTransitory(SYNC_TAGS, SYNC_ALARMS, SYNC_LOCATION))) {
+        if (updateTimestamp && (!task.insignificantChange(original) || task.checkTransitory(SYNC_TAGS, SYNC_ALARMS, SYNC_LOCATION, SYNC_ATTACHMENTS))) {
             task.modificationDate = DateTimeUtils2.currentTimeMillis()
         }
         if (original == null || task.reminderDismissed >= original.reminderDismissed) {

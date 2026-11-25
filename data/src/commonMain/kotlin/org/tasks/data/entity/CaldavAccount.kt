@@ -127,8 +127,9 @@ data class CaldavAccount(
 
         fun syncTraits(accountType: Int): Set<SyncTrait> = when (accountType) {
             TYPE_MICROSOFT -> setOf(SyncTrait.TAGS)
-            in TYPES_CALDAV -> setOf(
-                SyncTrait.TAGS, SyncTrait.ALARMS, SyncTrait.LOCATION, SyncTrait.START_DATE
+            in TYPES_CALDAV -> setOfNotNull(
+                SyncTrait.TAGS, SyncTrait.ALARMS, SyncTrait.LOCATION, SyncTrait.START_DATE,
+                SyncTrait.ATTACHMENTS.takeIf { accountType == TYPE_ETEBASE },
             )
             else -> emptySet()
         }
@@ -171,4 +172,4 @@ data class CaldavAccount(
 }
 
 /** A category of local change that some account types sync to their server. */
-enum class SyncTrait { TAGS, ALARMS, LOCATION, START_DATE }
+enum class SyncTrait { TAGS, ALARMS, LOCATION, START_DATE, ATTACHMENTS }

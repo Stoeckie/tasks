@@ -23,6 +23,7 @@ const val SUPPRESS_SYNC = "suppress_sync"
 const val SYNC_LOCATION = "sync_location"
 const val SYNC_TAGS = "sync_tags"
 const val SYNC_ALARMS = "sync_alarms"
+const val SYNC_ATTACHMENTS = "sync_attachments"
 
 @Serializable
 @CommonParcelize
