@@ -31,10 +31,16 @@ checkout https://github.com/etesync/etebase-rs.git $ETEBASE_RS_REV "$work/etebas
 checkout https://github.com/tasks/etebase-java.git $ETEBASE_JAVA_REV "$work/etebase-java" "$here/etebase-java.patch"
 cd "$work/etebase-java"
 rustup toolchain install --profile minimal "$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)"
-# Use the patched etebase-rs; Cargo.lock keeps every other dependency pinned.
+# Use the patched etebase-rs; Cargo.lock keeps every other dependency pinned (checked after the build: --locked
+# cannot be used, the patch changes the lock entry of etebase itself).
 patch_rs=(--config "patch.'https://github.com/etesync/etebase-rs'.etebase.path='$work/etebase-rs'")
+locked() { awk '/^name = /{n=$3} /^version = /{print n, $3}' "$1" | grep -v '^"etebase" ' | sort; }
+locked Cargo.lock > "$work/Cargo.lock.pinned"
+# No build paths in the binaries (reproducible from another directory or user).
+remap="--remap-path-prefix=$work=/build --remap-path-prefix=${CARGO_HOME:-$HOME/.cargo}=/cargo"
 # Allow the -tasksN suffix in the version check.
 sed -i 's/(-beta\\d{2}|-SNAPSHOT)?/(-beta\\d{2}(-tasks\\d+)?|-SNAPSHOT)?/' build.gradle
+grep -q 'tasks\\d+' build.gradle || { echo "version check in build.gradle not found" >&2; exit 1; }
 
 # Android, as in .github/workflows/build.yml of etebase-java
 mkdir -p "$work/libunwind-stub" && printf '!<arch>\n' > "$work/libunwind-stub/libunwind.a"
@@ -49,7 +55,7 @@ for abi_target_cc in \
     export SODIUM_LIB_DIR=$(./build-libsodium.sh "$2")
     triple_upper=$(echo "$2" | tr 'a-z-' 'A-Z_')
     export "CARGO_TARGET_${triple_upper}_LINKER=$3"
-    RUSTFLAGS="-L $work/libunwind-stub -C link-arg=-Wl,-z,max-page-size=16384 -C link-arg=-Wl,-z,common-page-size=16384" \
+    RUSTFLAGS="$remap -C link-arg=-Wl,-soname,libetebase_jni.so -L $work/libunwind-stub -C link-arg=-Wl,-z,max-page-size=16384 -C link-arg=-Wl,-z,common-page-size=16384" \
         cargo build -q "${patch_rs[@]}" --target "$2" --release
     python3 check-elf-alignment.py "target/$2/release/libetebase_jni.so"
     mkdir -p "client/src/main/jniLibs/$1"
@@ -64,7 +70,9 @@ case $host in
     aarch64-unknown-linux-gnu) subdir=linux-aarch64 ;;
     *) echo "unsupported host $host" >&2; exit 1 ;;
 esac
-SODIUM_LIB_DIR=$(./build-libsodium.sh "$host") cargo build -q "${patch_rs[@]}" --target "$host" --release --no-default-features --features jvm
+SODIUM_LIB_DIR=$(./build-libsodium.sh "$host") RUSTFLAGS="$remap" \
+    cargo build -q "${patch_rs[@]}" --target "$host" --release --no-default-features --features jvm
+locked Cargo.lock | diff "$work/Cargo.lock.pinned" - || { echo "Cargo.lock changed" >&2; exit 1; }
 mkdir -p "client-jvm/src/main/resources/com/etebase/client/native/$subdir"
 cp "target/$host/release/libetebase_jni.so" "client-jvm/src/main/resources/com/etebase/client/native/$subdir/"
 
