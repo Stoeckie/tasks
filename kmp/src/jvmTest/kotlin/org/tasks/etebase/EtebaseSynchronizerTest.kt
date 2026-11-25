@@ -167,7 +167,7 @@ class EtebaseSynchronizerTest : DatabaseTest() {
                 pushed
             }
         }
-        assertEquals("", sync())
+        assertEquals("cannot encrypt", sync()) // shown, not only logged
         verifyBlocking(client) { uploadChanges(any(), argThat { this == listOf(pushed) }) }
         assertTrue(dirtyDao.isDirty(caldavDao.getTask(bad.id)!!.id) == true)
         assertTrue(dirtyDao.isDirty(caldavDao.getTask(good.id)!!.id) != true)
@@ -258,7 +258,7 @@ class EtebaseSynchronizerTest : DatabaseTest() {
                 throw HttpException("413 Request Entity Too Large")
             }
         }
-        assertEquals("", sync())
+        assertEquals("413 Request Entity Too Large", sync()) // shown, not only logged
         verifyBlocking(client) { uploadChanges(eq(collection2), any()) }
         assertTrue(dirtyDao.isDirty(caldavDao.getTask(big.id)!!.id) == true)
         // the proxy accepts it now: the task is pushed with its attachment
@@ -286,7 +286,7 @@ class EtebaseSynchronizerTest : DatabaseTest() {
                 files[it.getArgument<String>(1)]?.let(::itemContent)
             }
         }
-        assertEquals("", sync())
+        assertEquals("500", sync()) // shown: this list is not pushed while it lasts
         val task = taskDao.getAll().single()
         assertEquals(emptySet<String>(), linked(task.id))
         assertNull(caldavDao.getCalendar("cal")!!.ctag) // listed again next time

@@ -152,8 +152,9 @@ class EtebaseAttachments(
         for (file in local) {
             if (refs.any { it.id == file.remoteId }) continue
             val size = store.size(file.uri) ?: run {
-                // without file and not referenced (a placeholder copied with a duplicated task): no attachment
-                dao.delete(task, file.remoteId)
+                // a placeholder (no uri) copied with a duplicated task: no attachment. A file that cannot be read now
+                // (storage unmounted, permission lost) stays linked and is pushed when it can be read again
+                if (file.uri.isEmpty()) dao.delete(task, file.remoteId)
                 continue
             }
             if (problem(size, refs.size, refs.sumOf { it.size }) != null) continue // the editor tells why

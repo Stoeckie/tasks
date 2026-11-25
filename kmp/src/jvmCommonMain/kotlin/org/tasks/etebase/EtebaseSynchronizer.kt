@@ -62,7 +62,7 @@ class EtebaseSynchronizer(
             return
         }
         try {
-            synchronize(account)
+            val problems = synchronize(account)
             if (account.lastSync == 0L) {
                 val taskCount = caldavDao.getTaskCountForAccount(account.uuid!!)
                 reporting.logEvent(
@@ -73,7 +73,8 @@ class EtebaseSynchronizer(
                 )
             }
             account.lastSync = currentTimeMillis()
-            setError(account, "")
+            // what was skipped (a task the server refused, a list not pushed) is shown, not only logged
+            setError(account, problems.firstOrNull().orEmpty())
         } catch (e: ConnectionException) {
             setError(account, e)
         } catch (e: PermissionDeniedException) {
@@ -90,7 +91,9 @@ class EtebaseSynchronizer(
         }
     }
 
-    private suspend fun synchronize(account: CaldavAccount) {
+    /** Returns what could not be synchronized (each is logged where it happened; the rest synchronized). */
+    private suspend fun synchronize(account: CaldavAccount): List<String> {
+        val problems = ArrayList<String>()
         val client = clientProvider.forAccount(account)
         val collections = client.getCollections()
         val uids = collections.map { it.uid }
@@ -102,25 +105,27 @@ class EtebaseSynchronizer(
         // elsewhere is followed to where the task is now
         val moves = Moves()
         val fetched = collections.mapNotNull { collection ->
-            perList(collection) {
+            perList(collection, problems) {
                 val calendar = calendar(account, collection)
                 // a list fetched only in part is not pushed: its cache may lack items this device pushed itself
-                calendar.takeIf { fetchChanges(account, client, calendar, collection, moves) }?.let { it to collection }
+                calendar.takeIf { fetchChanges(account, client, calendar, collection, moves, problems) }?.let { it to collection }
             }
         }
         followMoves(account, client, moves)
         for ((calendar, collection) in fetched) {
-            perList(collection) { pushLocalChanges(account, client, calendar, collection, moves.adopted) }
+            perList(collection, problems) { pushLocalChanges(account, client, calendar, collection, moves.adopted, problems) }
         }
+        return problems
     }
 
     /** One list never stops the sync of the others. */
-    private suspend fun <T> perList(collection: Collection, block: suspend () -> T): T? =
+    private suspend fun <T> perList(collection: Collection, problems: MutableList<String>, block: suspend () -> T): T? =
         try {
             block()
         } catch (e: Exception) {
             if (e.endsSync) throw e
             Logger.e("EtebaseSynchronizer", e) { "Not synchronized: ${collection.uid}" }
+            problems.add(e.problem)
             null
         }
 
@@ -171,6 +176,7 @@ class EtebaseSynchronizer(
         caldavCalendar: CaldavCalendar,
         collection: Collection,
         moves: Moves,
+        problems: MutableList<String>,
     ): Boolean {
         if (caldavCalendar.ctag?.equals(collection.stoken) == true) {
             Logger.d("EtebaseSynchronizer") { "${caldavCalendar.name} up to date" }
@@ -192,6 +198,8 @@ class EtebaseSynchronizer(
                         // the server could not give it (or an attachment of it) now: listed again by the next sync
                         complete = false
                         Logger.e("EtebaseSynchronizer", e) { "Not fetched: item ${item.uid}" }
+                        // a 500 that lasts stops the pushes of this list: the user is told (a change meanwhile is normal)
+                        if (e is ServerErrorException) problems.add(e.problem)
                         return@mapNotNull null
                     }
                     // one bad item never stops the sync of the others
@@ -421,6 +429,7 @@ class EtebaseSynchronizer(
         caldavCalendar: CaldavCalendar,
         collection: Collection,
         later: Set<Long>,
+        problems: MutableList<String>,
     ) {
         val changes = ArrayList<Change>()
         for (caldavTask in caldavDao.getMoved(caldavCalendar.uuid!!)) {
@@ -429,6 +438,7 @@ class EtebaseSynchronizer(
             } catch (e: Exception) {
                 if (e.endsSync) throw e
                 Logger.e("EtebaseSynchronizer", e) { "Old item kept: task ${caldavTask.task}" }
+                problems.add(e.problem)
             }
         }
         for (toPush in dirtyDao.getTasksToPush(caldavCalendar.uuid!!)) {
@@ -446,6 +456,8 @@ class EtebaseSynchronizer(
                 if (e.endsSync) throw e
                 // one task never stops the push of the others; it stays dirty (also after a 413 from a proxy)
                 Logger.e("EtebaseSynchronizer", e) { "Not pushed: task ${toPush.task.id}" }
+                // shown: say a proxy body limit (413) or a list shared read-only (403); tried again by every sync
+                problems.add(e.problem)
             }
         }
         upload(client, collection, caldavCalendar, changes)
@@ -601,6 +613,8 @@ class EtebaseSynchronizer(
     }
 
     companion object {
+        private val Throwable.problem get() = message?.takeIf { it.isNotBlank() } ?: javaClass.simpleName
+
         /** Description of the deleted old item of a moved task: `moved:<list>/<UID in that list>`. */
         private const val MOVED = "moved:"
     }

@@ -132,7 +132,7 @@ class EtebaseScenarioTest {
         val big = { r: org.tasks.etebase.sim.Request -> r.isTransaction && r.body!!.size > 100_000 }
         repeat(3) {
             a.http.faults.add(Fault(FaultKind.REFUSE, big, "upload > 100 kB"))
-            synced(a)
+            assertTrue("the refusal is shown", a.sync().error.isNotEmpty())
         }
         assertEquals(setOf("t", "other"), titles(l1)) // the old item stays until the carry is done
         val downloads = attachmentDownloads(a)
@@ -421,7 +421,135 @@ class EtebaseScenarioTest {
         collection.meta = collection.meta.apply { color = "#zzzzzz" }
         manager.upload(collection, null)
         a.newTask(l2, "other")
-        synced(a)
+        assertTrue("shown", a.sync().error.isNotEmpty())
         assertEquals(setOf("other"), titles(l2))
+    }
+
+    /**
+     * REVIEW6 H1 (partly fixed): a proxy refuses every request body above 100 kB. The refusal is the account error, the
+     * other tasks sync; the refused task stays dirty and is tried again by every sync (known limitation) until the
+     * proxy accepts it.
+     */
+    @Test
+    fun refusedUploadIsShownAndTheOtherTasksSync() = runBlocking {
+        val a = device("A")
+        val b = device("B")
+        a.proxyLimit = 100_000
+        a.restart()
+        val big = a.newTask(l1, "big").id
+        synced(a)
+        a.attach(big, "photo.jpg", random(300_000, 71))
+        a.newTask(l1, "other")
+        repeat(2) { assertTrue("the refusal is shown", a.sync().error.isNotEmpty()) }
+        assertEquals(setOf("big", "other"), titles(l1))
+        assertEquals(emptySet<String>(), refs(l1, "big"))
+        a.proxyLimit = null
+        a.restart()
+        synced(a)
+        synced(b)
+        assertEquals(1, refs(l1, "big").size)
+        assertEquals(random(300_000, 71).toList(), b.files(b.task("big")).values.single()!!.toList())
+    }
+
+    /** REVIEW6 H1: a member who may only read a list adds an attachment there: shown as the account error. */
+    @Test
+    fun readOnlyListIsShown() = runBlocking {
+        val a = device("A")
+        a.newTask(l1, "shared")
+        synced(a)
+        val b = device("B")
+        b.readOnly = setOf(l1)
+        b.restart()
+        b.attach(b.task("shared"), "scan.pdf", random(20_000, 72))
+        b.newTask(l2, "own")
+        assertTrue("the refusal is shown", b.sync().error.isNotEmpty())
+        assertEquals(setOf("own"), titles(l2))
+        assertEquals(emptySet<String>(), refs(l1, "shared"))
+    }
+
+    /** REVIEW6 L1: an item that the server cannot give stops the pushes of its list; that is shown, not silent. */
+    @Test
+    fun itemThatTheServerCannotGiveIsShown() = runBlocking {
+        val a = device("A")
+        val b = device("B")
+        a.newTask(l1, "broken")
+        a.newTask(l1, "fine")
+        synced(a)
+        a.edit(a.task("broken")) { notes = "changed" }
+        synced(a)
+        val uid = world.view().tasks[l1]!!.entries.single { it.value.summary == "broken" }.key
+        val broken = { r: org.tasks.etebase.sim.Request -> r.isItemGet && r.path.contains(uid) }
+        repeat(50) { b.http.faults.add(Fault(FaultKind.SERVER_ERROR, broken, "GET broken")) }
+        b.newTask(l2, "elsewhere")
+        assertTrue("the 500 is shown", b.sync().error.isNotEmpty())
+        assertEquals(setOf("elsewhere"), titles(l2)) // the other lists sync
+        b.edit(b.task("fine")) { notes = "edited on B" }
+        assertTrue("the 500 is shown", b.sync().error.isNotEmpty())
+        b.http.faults.clear()
+        synced(b)
+        assertEquals("edited on B", world.view().tasks[l1]!!.values.single { it.summary == "fine" }.description)
+        assertEquals("changed", b.tasks().single { it.first.title == "broken" }.first.notes)
+    }
+
+    /** REVIEW6: the account removed and logged in again: the files on the device are linked again, not downloaded. */
+    @Test
+    fun loginAgainLinksTheFilesWithoutDownload() = runBlocking {
+        val a = device("A")
+        val b = device("B")
+        a.attach(a.newTask(l1, "t").id, "a.bin", random(20_000, 73))
+        synced(a)
+        synced(b)
+        val downloads = attachmentDownloads(b)
+        b.logout()
+        synced(b)
+        assertEquals(downloads, attachmentDownloads(b))
+        assertEquals(random(20_000, 73).toList(), b.files(b.task("t")).values.single()!!.toList())
+        b.edit(b.task("t")) { notes = "after login" }
+        synced(b)
+        assertEquals(1, refs(l1, "t").size)
+        assertEquals(1, world.view().tasks[l1]!!.values.count { it.summary == "t" })
+    }
+
+    /** REVIEW6: a device without files (desktop) moves a task with an attachment there and back. */
+    @Test
+    fun deviceWithoutFilesMovesATask() = runBlocking {
+        val a = device("A")
+        val d = device("D", keepsFiles = false)
+        a.attach(a.newTask(l1, "t").id, "a.bin", random(40_000, 74))
+        synced(a)
+        synced(d)
+        d.move(d.task("t"), l2)
+        repeat(2) { synced(d); synced(a) }
+        assertEquals(emptySet<String>(), titles(l1))
+        assertEquals(1, refs(l2, "t").size)
+        d.move(d.task("t"), l1)
+        repeat(2) { synced(d); synced(a) }
+        assertEquals(emptySet<String>(), titles(l2))
+        assertEquals(1, refs(l1, "t").size)
+        assertEquals(random(40_000, 74).toList(), a.files(a.task("t")).values.single()!!.toList())
+    }
+
+    /** REVIEW6: a parent and its subtask with an attachment are moved; then the parent is deleted on another device. */
+    @Test
+    fun subtaskWithAttachmentMovesWithItsParent() = runBlocking {
+        val a = device("A")
+        val b = device("B")
+        val parent = a.newTask(l1, "parent")
+        val child = a.newSubtask(parent.id, "child")!!
+        a.attach(child.id, "c.bin", random(10_000, 75))
+        synced(a)
+        synced(b)
+        a.move(parent.id, l2)
+        b.attach(b.task("child"), "c2.bin", random(10_000, 76))
+        synced(b)
+        repeat(2) { synced(a); synced(b) }
+        assertEquals(setOf("parent", "child"), titles(l2))
+        assertEquals(emptySet<String>(), titles(l1))
+        assertEquals(2, refs(l2, "child").size)
+        assertEquals(2, a.files(a.task("child")).values.count { it != null })
+        b.delete(b.task("parent"))
+        synced(b)
+        synced(a)
+        assertEquals(emptyList<String>(), a.tasks().map { it.first.title })
     }
 }

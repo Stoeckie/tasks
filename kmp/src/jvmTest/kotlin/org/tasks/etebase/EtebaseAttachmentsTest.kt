@@ -149,6 +149,32 @@ class EtebaseAttachmentsTest : DatabaseTest() {
     }
 
     @Test
+    fun fileThatCannotBeReadAtPushTimeStaysLinkedAndIsPushedLater() = runBlocking {
+        val task = newTask()
+        val data = bytes(1000)
+        addFile(task, "f1", data)
+        val saved = store.files.remove("mem://local/f1")!! // say the SD card is unmounted
+        val vtodo = vtodo()
+        push(task, vtodo)
+        assertEquals(0, created.size)
+        assertEquals(setOf("f1"), linked(task))
+        store.files["mem://local/f1"] = saved
+        push(task, vtodo)
+        assertEquals(1, created.size)
+        assertEquals("f1", parse(vtodo).single().id)
+    }
+
+    @Test
+    fun placeholderCopiedWithADuplicateIsUnlinkedByThePush() = runBlocking {
+        val task = newTask()
+        dao.insert(TaskAttachment(remoteId = "f1", name = "f1.png", uri = ""))
+        dao.insert(listOf(Attachment(task = task, fileId = dao.getAttachment("f1")!!.id!!, attachmentUid = "f1")))
+        push(task, vtodo())
+        assertEquals(emptySet<String>(), linked(task))
+        assertEquals(0, created.size)
+    }
+
+    @Test
     fun removalOnThisDeviceDropsTheReferenceAndDeletesTheItem() = runBlocking {
         val task = newTask()
         val data = bytes(1000)
