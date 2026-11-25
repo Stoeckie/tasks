@@ -1,0 +1,152 @@
+From 0b91b2d6f0d94f44633038482bafb57508e7eafc Mon Sep 17 00:00:00 2001
+From: Stoeckie <15266544+Stoeckie@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 00:13:51 +0000
+Subject: [PATCH] Fix chunk indices of content with repeated chunks
+
+set_content() drops chunks that repeat an earlier chunk, but wrote the
+index list with positions of the list before the duplicates were
+removed, and wrote the index of a duplicate at its shuffled position
+instead of its original one. content() then indexed past the end of the
+chunk list and panicked, or returned the chunks in a wrong order.
+Any content over 16 KiB with repeated chunks triggered it (zeros,
+uniform image regions, repeated text).
+
+Map every original position through the shuffle and the filter, and
+make content() return an error for an index out of range, so that items
+written by affected versions are reported instead of panicking. Items
+written by this version are read correctly by earlier versions too.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/encrypted_models.rs | 102 +++++++++++++++++++++++++++++++---------
+ 1 file changed, 79 insertions(+), 23 deletions(-)
+
+diff --git a/src/encrypted_models.rs b/src/encrypted_models.rs
+index fd769eb..d0a3358 100644
+--- a/src/encrypted_models.rs
++++ b/src/encrypted_models.rs
+@@ -611,25 +611,26 @@ impl EncryptedRevision {
+         if chunks.len() > 0 {
+             let mut indices = shuffle(&mut chunks);
+ 
+-            // Filter duplicates and construct the indice list.
++            // Filter duplicates. `indices` maps an original position to a position in the shuffled list; map it on to
++            // the position in the filtered list, which is what content() indexes.
+             let mut uid_indices: HashMap<String, usize> = HashMap::new();
+-            chunks = chunks
+-                .into_iter()
+-                .enumerate()
+-                .filter_map(|(i, chunk)| {
+-                    let uid = &chunk.0;
+-                    match uid_indices.get(uid) {
+-                        Some(previous_index) => {
+-                            indices[i] = *previous_index;
+-                            None
+-                        },
+-                        None => {
+-                            uid_indices.insert(uid.to_string(), i);
+-                            Some(chunk)
+-                        }
++            let mut kept_index = Vec::with_capacity(chunks.len());
++            let mut kept = Vec::with_capacity(chunks.len());
++            for chunk in chunks.into_iter() {
++                let index = match uid_indices.get(&chunk.0) {
++                    Some(previous_index) => *previous_index,
++                    None => {
++                        uid_indices.insert(chunk.0.clone(), kept.len());
++                        kept.push(chunk);
++                        kept.len() - 1
+                     }
+-                })
+-                .collect();
++                };
++                kept_index.push(index);
++            }
++            chunks = kept;
++            for index in indices.iter_mut() {
++                *index = kept_index[*index];
++            }
+ 
+             // If we have more than one chunk we need to encode the mapping header in the last chunk
+             if indices.len() > 1 {
+@@ -699,12 +700,12 @@ impl EncryptedRevision {
+         match indices {
+             Some(indices) => {
+                 if indices.len() > 1 {
+-                    let sorted_chunks: Vec<u8> = indices
+-                        .into_iter()
+-                        .map(|index| &decrypted_chunks[index])
+-                        .flatten()
+-                        .map(|x| *x)
+-                        .collect::<Vec<u8>>();
++                    let mut sorted_chunks: Vec<u8> = Vec::new();
++                    for index in indices {
++                        // Items written by versions with a bug in set_content() can have indices out of range
++                        let chunk = decrypted_chunks.get(index).ok_or(Error::Encryption("Got an invalid chunk index"))?;
++                        sorted_chunks.extend_from_slice(chunk);
++                    }
+ 
+                     Ok(sorted_chunks)
+                 } else {
+@@ -916,3 +917,58 @@ impl EncryptedItem {
+             .collect()
+     }
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn crypto_manager() -> ItemCryptoManager {
++        crate::init().unwrap();
++        ItemCryptoManager::new(&[7; 32], CURRENT_VERSION).unwrap()
++    }
++
++    fn round_trip(content: &[u8]) {
++        let crypto_manager = crypto_manager();
++        for _ in 0..20 {
++            let revision = EncryptedRevision::new(&crypto_manager, b"ad", b"meta", content).unwrap();
++            assert_eq!(revision.content(&crypto_manager).unwrap(), content);
++        }
++    }
++
++    #[test]
++    fn repeated_chunks_are_read_back() {
++        round_trip(&[0; 300 * 1024]);
++        let pattern: Vec<u8> = (0..2 * 1024 * 1024usize).map(|i| ((i * 31 + 1) ^ (i >> 7)) as u8).collect();
++        round_trip(&pattern);
++    }
++
++    #[test]
++    fn repeated_chunks_are_stored_once() {
++        let crypto_manager = crypto_manager();
++        let revision = EncryptedRevision::new(&crypto_manager, b"ad", b"meta", &[0; 300 * 1024]).unwrap();
++        // 300 KiB of zeros: one chunk repeated, plus a shorter last chunk and the index chunk
++        assert_eq!(revision.chunks.len(), 3);
++    }
++
++    #[test]
++    fn content_without_repeated_chunks_is_unchanged() {
++        let content: Vec<u8> = (0..200 * 1024u32).map(|i| (i.wrapping_mul(2654435761) >> 13) as u8).collect();
++        round_trip(&content);
++        round_trip(b"short");
++        round_trip(b"");
++    }
++
++    #[test]
++    fn invalid_chunk_index_is_an_error() {
++        // What set_content() of affected versions writes: an index past the end of the chunk list
++        let crypto_manager = crypto_manager();
++        let mut revision = EncryptedRevision::new(&crypto_manager, b"ad", b"meta", b"x").unwrap();
++        let chunk = |buf: Vec<u8>| {
++            let hash = to_base64(&crypto_manager.0.calculate_mac(&buf).unwrap()).unwrap();
++            ChunkArrayItem(hash, Some(crypto_manager.0.encrypt(&buffer_pad(&buf).unwrap(), None).unwrap()))
++        };
++        let header = rmp_serde::to_vec_named(&(vec![0usize, 80], )).unwrap();
++        revision.chunks = vec![chunk(vec![1; 10]), chunk(header)];
++        assert!(matches!(revision.content(&crypto_manager), Err(Error::Encryption(_))));
++    }
++}
+-- 
+2.47.3
+

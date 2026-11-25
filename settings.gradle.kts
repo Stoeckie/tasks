@@ -28,6 +28,14 @@ gradle.beforeProject {
 
 dependencyResolutionManagement {
     repositories {
+        // Patched etebase library, built by etebase/build.sh
+        exclusiveContent {
+            forRepository { maven(layout.rootDirectory.dir("etebase/repo")) }
+            filter {
+                includeModule("org.tasks", "etebase-android")
+                includeModule("org.tasks", "etebase-jvm")
+            }
+        }
         google {
             mavenContent {
                 includeGroupAndSubgroups("androidx")

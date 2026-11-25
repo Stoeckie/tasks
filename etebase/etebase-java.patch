@@ -1,0 +1,123 @@
+From 6d268505ea2ef1cb4c63facb305fd7db4e37cc07 Mon Sep 17 00:00:00 2001
+From: Stoeckie <15266544+Stoeckie@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 00:13:51 +0000
+Subject: [PATCH] Turn panics in JNI entry points into Java exceptions
+
+A panic cannot unwind out of an extern "C" function, so any panic in
+etebase-rs or in the glue (for example reading an item whose content
+was written with wrong chunk indices) aborted the whole Java process.
+
+build.rs now wraps the body of every generated Java_* entry point in
+catch_unwind. A caught panic becomes an EtebaseException in Java,
+unless a Java exception is already pending, and the entry point returns
+a zero value.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ build.rs   | 61 ++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ src/lib.rs | 21 +++++++++++++++++++
+ 2 files changed, 82 insertions(+)
+
+diff --git a/build.rs b/build.rs
+index 2c01f45..8e4ba73 100644
+--- a/build.rs
++++ b/build.rs
+@@ -36,5 +36,66 @@ fn main() {
+     .remove_not_generated_files_from_output_directory(true)
+     .rustfmt_bindings(true);
+     swig_gen.expand("etebase jni bindings", &in_src, &out_src);
++    catch_panics(&out_src);
+     println!("cargo:rerun-if-changed={}", in_src.display());
+ }
++
++/// Wraps the body of every generated JNI entry point in `catch_unwind`. A panic cannot unwind out of an
++/// `extern "C"` function, so without this any panic aborts the whole Java process. A caught panic becomes a
++/// Java `EtebaseException` (see `jni_throw_panic`) and the entry point returns a zero value.
++fn catch_panics(path: &Path) {
++    let code = std::fs::read_to_string(path).unwrap();
++    let marker = "extern \"C\" fn Java_";
++    let mut out = String::with_capacity(code.len() + code.len() / 4);
++    let mut rest = &code[..];
++    while let Some(start) = rest.find(marker) {
++        let args_start = start + rest[start..].find('(').unwrap();
++        let args_end = matching(rest, args_start, '(', ')');
++        let body_start = args_end + rest[args_end..].find('{').unwrap();
++        let body_end = matching(rest, body_start, '{', '}');
++        let ret = rest[args_end + 1..body_start].trim().trim_start_matches("->").trim();
++        let ret = if ret.is_empty() { "()" } else { ret };
++        out.push_str(&rest[..=body_start]);
++        if rest[args_start + 1..].split(':').next().unwrap().trim() != "env" {
++            // `_env`: generated stubs that use no JNI and do nothing that can panic
++            rest = &rest[body_start + 1..];
++            continue;
++        }
++        out.push_str(&format!(
++            "match ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(move || -> {ret} {body})) \
++             {{ Ok(ret) => ret, Err(panic) => {{ crate::jni_throw_panic(env, panic); unsafe {{ ::std::mem::zeroed() }} }} }} }}",
++            ret = ret,
++            body = &rest[body_start..=body_end],
++        ));
++        rest = &rest[body_end + 1..];
++    }
++    out.push_str(rest);
++    std::fs::write(path, out).unwrap();
++}
++
++/// Index of the bracket that closes the one at `open_at`, skipping string literals.
++fn matching(code: &str, open_at: usize, open: char, close: char) -> usize {
++    let mut depth = 0;
++    let mut in_string = false;
++    let mut escaped = false;
++    for (i, c) in code[open_at..].char_indices() {
++        if in_string {
++            match c {
++                _ if escaped => escaped = false,
++                '\\' => escaped = true,
++                '"' => in_string = false,
++                _ => {}
++            }
++        } else if c == '"' {
++            in_string = true;
++        } else if c == open {
++            depth += 1;
++        } else if c == close {
++            depth -= 1;
++            if depth == 0 {
++                return open_at + i;
++            }
++        }
++    }
++    panic!("unbalanced {} in generated code", open);
++}
+diff --git a/src/lib.rs b/src/lib.rs
+index 9f6c3b5..aa4e0a1 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -160,3 +160,24 @@ impl FetchOptions {
+         ret
+     }
+ }
++
++/// Turns a panic caught in a JNI entry point into a Java `EtebaseException`, unless an exception is already pending
++/// (for example one thrown by a Java callback, which then reaches the caller unchanged).
++#[doc(hidden)]
++pub fn jni_throw_panic(env: *mut jni_sys::JNIEnv, panic: Box<dyn std::any::Any + Send>) {
++    let msg = panic
++        .downcast_ref::<&str>()
++        .map(|s| s.to_string())
++        .or_else(|| panic.downcast_ref::<String>().cloned())
++        .unwrap_or_default();
++    let msg = std::ffi::CString::new(format!("etebase panicked: {}", msg).replace('\0', " ")).unwrap_or_default();
++    unsafe {
++        if (**env).ExceptionCheck.unwrap()(env) != 0 {
++            return;
++        }
++        let class = (**env).FindClass.unwrap()(env, b"com/etebase/client/exceptions/EtebaseException\0".as_ptr() as *const _);
++        if !class.is_null() {
++            (**env).ThrowNew.unwrap()(env, class, msg.as_ptr());
++        }
++    }
++}
+-- 
+2.47.3
+
