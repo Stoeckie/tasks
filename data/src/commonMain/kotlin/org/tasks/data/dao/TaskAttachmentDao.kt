@@ -42,14 +42,22 @@ interface TaskAttachmentDao {
     @Delete
     suspend fun delete(value: List<TaskAttachment>)
 
-    // Sync state of attachments (EteSync): rows of [category] whose key starts with [prefix]
+    // EteSync: attachments that the user removed from a task on this device, until the removal is pushed
+    // (metadata_tombstone, key "<task>/<file id>")
 
     @Insert(onConflict = OnConflictStrategy.REPLACE)
-    suspend fun insertState(state: MetadataTombstone)
+    suspend fun insertRemoved(removed: MetadataTombstone)
 
-    @Query("SELECT * FROM metadata_tombstone WHERE category = :category AND substr(entity_key, 1, length(:prefix)) = :prefix")
-    suspend fun getStates(category: String, prefix: String = ""): List<MetadataTombstone>
+    @Query("SELECT substr(entity_key, length(:task) + 2) FROM metadata_tombstone WHERE category = '$REMOVED' AND entity_key LIKE :task || '/%'")
+    suspend fun getRemoved(task: Long): List<String>
 
-    @Query("DELETE FROM metadata_tombstone WHERE category = :category AND substr(entity_key, 1, length(:prefix)) = :prefix")
-    suspend fun deleteStates(category: String, prefix: String)
+    @Query("DELETE FROM metadata_tombstone WHERE category = '$REMOVED' AND entity_key = :task || '/' || :file")
+    suspend fun deleteRemoved(task: Long, file: String)
+
+    @Query("DELETE FROM metadata_tombstone WHERE category = '$REMOVED' AND entity_key LIKE :task || '/%'")
+    suspend fun deleteRemoved(task: Long)
+
+    companion object {
+        const val REMOVED = "etebase_attachment_removed"
+    }
 }

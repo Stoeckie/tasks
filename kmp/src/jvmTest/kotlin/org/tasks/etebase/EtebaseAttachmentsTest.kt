@@ -10,7 +10,6 @@ import org.tasks.DatabaseTest
 import org.tasks.data.entity.Attachment
 import org.tasks.data.entity.Task
 import org.tasks.data.entity.TaskAttachment
-import org.tasks.etebase.EtebaseAttachments.Companion.MAX_BYTES
 import org.tasks.etebase.EtebaseAttachments.Companion.fromItemContent
 import org.tasks.etebase.EtebaseAttachments.Companion.itemContent
 import org.tasks.etebase.EtebaseAttachments.Companion.parse
@@ -21,7 +20,6 @@ import org.tasks.icalendar.ICalProperty
 import org.tasks.icalendar.VTodo
 import org.tasks.icalendar.parseVTodos
 import org.tasks.icalendar.serialize
-import org.tasks.etebase.EtebaseAttachments.Companion.Problem
 import kotlin.random.Random
 
 class EtebaseAttachmentsTest : DatabaseTest() {
@@ -37,6 +35,7 @@ class EtebaseAttachmentsTest : DatabaseTest() {
     private val dao = db.taskAttachmentDao()
     private val store = MemStore()
     private val attachments = EtebaseAttachments(dao, store)
+    private val MAX_BYTES = attachments.limits.maxBytes
     private val created = ArrayList<ByteArray>()
     private val deleted = ArrayList<String>()
     private val copied = ArrayList<String>()
@@ -67,7 +66,7 @@ class EtebaseAttachmentsTest : DatabaseTest() {
             task = task,
             vtodo = vtodo,
             carried = carried,
-            create = { _, content -> created.add(fromItemContent(content)!!); "new${created.size}" },
+            create = { content -> created.add(fromItemContent(content)!!); "new${created.size}" },
             delete = { deleted.add(it) },
             copy = { ref -> copied.add(ref.uid); server[ref.uid]?.let(::itemContent) },
         )
@@ -216,8 +215,8 @@ class EtebaseAttachmentsTest : DatabaseTest() {
         push(task, vtodo, carried = old)
         assertEquals(1, copied.size)
         assertEquals(2, created.size)
-        // the old item can go, with the items that the new list has copies of and the removed one
-        assertEquals(listOf("o1", "o2", "o3"), attachments.leftBehind(task, old, parse(vtodo)))
+        // nothing is left to carry: the old item can go
+        assertEquals(emptyList<AttachmentRef>(), attachments.toCarry(task, old, parse(vtodo)) { true })
     }
 
     /** REVIEW4 F1: a reference added to the old item during the move is carried by the next push. */
@@ -230,10 +229,20 @@ class EtebaseAttachmentsTest : DatabaseTest() {
         val vtodo = vtodo()
         push(task, vtodo, carried = parse(vtodo(ref(f, "o1", "f"))))
         val old = parse(vtodo(ref(f, "o1", "f"), ref(x, "o2", "x")))
-        assertNull(attachments.leftBehind(task, old, parse(vtodo)))
-        push(task, vtodo, carried = old)
+        assertEquals(listOf("x"), attachments.toCarry(task, old, parse(vtodo)) { true }.map { it.id })
+        push(task, vtodo, carried = attachments.toCarry(task, old, parse(vtodo)) { true })
         assertEquals(listOf("o2"), copied)
-        assertEquals(listOf("o1", "o2"), attachments.leftBehind(task, old, parse(vtodo)))
+        assertEquals(emptyList<AttachmentRef>(), attachments.toCarry(task, old, parse(vtodo)) { true })
+    }
+
+    /** An attachment of the old item that this device has no file of and never saw in the old list is gone there. */
+    @Test
+    fun attachmentNeverSeenInTheOldListIsNotCarried() = runBlocking {
+        val task = newTask()
+        val f = bytes(1000, 1)
+        addFile(task, "f", f)
+        val old = parse(vtodo(ref(f, "o1", "f"), ref(bytes(1000, 2), "o2", "x")))
+        assertEquals(listOf("f"), attachments.toCarry(task, old, emptyList()) { false }.map { it.id })
     }
 
     @Test
@@ -245,11 +254,11 @@ class EtebaseAttachmentsTest : DatabaseTest() {
             task = task,
             vtodo = vtodo,
             carried = old,
-            create = { _, _ -> error("nothing to upload") },
+            create = { error("nothing to upload") },
             copy = { throw IllegalStateException("Got an invalid chunk index") },
         )
         assertEquals(listOf("o1"), parse(vtodo).map { it.uid })
-        assertEquals(emptyList<String>(), attachments.leftBehind(task, old, parse(vtodo))) // its item stays
+        assertEquals(emptyList<AttachmentRef>(), attachments.toCarry(task, old, parse(vtodo)) { true })
     }
 
     @Test
@@ -328,11 +337,18 @@ class EtebaseAttachmentsTest : DatabaseTest() {
         val remote = vtodo(ref(bytes(1000), "u1", "f1"))
         server.clear()
         pull(task, remote, base = null)
-        assertEquals(emptySet<String>(), linked(task))
-        assertEquals(mapOf("f1" to ("f1.png" to Problem.NOT_DOWNLOADED)), attachments.failures(task))
+        // a placeholder: the editor shows it, without file
+        assertEquals(setOf("f1"), linked(task))
+        assertEquals("", dao.getAttachment("f1")!!.uri)
         push(task, remote)
         assertEquals(1, parse(remote).size)
         assertEquals(emptyList<String>(), deleted)
+        assertEquals(emptyList<ByteArray>(), created)
+        // the next change of the task on the server tries again
+        server["u1"] = bytes(1000)
+        pull(task, remote, base = remote)
+        assertArrayEquals(bytes(1000), store.files[dao.getAttachment("f1")!!.uri])
+        assertEquals(setOf("f1"), linked(task))
     }
 
     @Test
@@ -341,7 +357,7 @@ class EtebaseAttachmentsTest : DatabaseTest() {
         val remote = vtodo(ref(bytes(1000), "u1", "f1"))
         server["u1"] = bytes(1000, 99)
         pull(task, remote, base = null)
-        assertEquals(emptySet<String>(), linked(task))
+        assertEquals("", dao.getAttachment("f1")!!.uri) // only a placeholder
         assertTrue(store.files.isEmpty())
     }
 
@@ -385,7 +401,8 @@ class EtebaseAttachmentsTest : DatabaseTest() {
                 server[r.uid]
             }
         }
-        assertEquals(listOf("F"), dao.getAttachments(t2).map { it.remoteId })
+        assertEquals(setOf("F", "BAD"), linked(t2))
+        assertEquals("", dao.getAttachment("BAD")!!.uri) // a placeholder
         push(t2, vtodo(*remote.unknownProperties.toTypedArray()))
         assertEquals(emptyList<String>(), deleted)
     }

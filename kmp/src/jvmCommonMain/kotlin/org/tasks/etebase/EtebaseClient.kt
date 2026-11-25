@@ -9,7 +9,6 @@ import com.etebase.client.ItemManager
 import com.etebase.client.ItemMetadata
 import com.etebase.client.PrefetchOption
 import com.etebase.client.exceptions.ConnectionException
-import com.etebase.client.exceptions.NotFoundException
 import com.etebase.client.exceptions.ServerErrorException
 import com.etebase.client.exceptions.TemporaryServerErrorException
 import com.etebase.client.exceptions.UnauthorizedException
@@ -21,6 +20,7 @@ import org.tasks.data.entity.CaldavTask
 import org.tasks.http.translateExceptions
 import org.tasks.time.DateTimeUtils2.currentTimeMillis
 import java.util.concurrent.ConcurrentHashMap
+import kotlin.coroutines.cancellation.CancellationException
 
 class EtebaseClient(
         private val filesDir: String,
@@ -82,24 +82,39 @@ class EtebaseClient(
     suspend fun isCached(collection: Collection, item: Item): Boolean =
         cache.itemGet(itemManager(collection), collection.uid, item.uid)?.etag == item.etag
 
-    /** The current revision of an item, with content. */
+    /**
+     * Whether this device listed item [uid] in [collection] and it was not deleted then. The server answers 500 for a
+     * uid it does not have, so nothing asks it for one this device has not seen.
+     */
+    suspend fun isSeen(collection: Collection, uid: String): Boolean =
+        cache.itemGet(itemManager(collection), collection.uid, uid)?.isDeleted == false
+
+    /** The content of task item [uid] as this device last synced it, if it has it. */
+    suspend fun cachedVtodo(collection: Collection, uid: String): String? =
+        cache.itemGet(itemManager(collection), collection.uid, uid)
+            ?.takeIf { !it.isDeleted && !it.isMissingContent }
+            ?.let { runCatching { it.contentString }.getOrNull() }
+
+    /** The current revision of a listed item, with content. */
     suspend fun fetch(collection: Collection, uid: String): Item = withContext(Dispatchers.IO) {
         itemManager(collection).fetch(uid, null)
     }
 
-    /** The current revision of item [uid], with content, or null when there is no such item. */
-    suspend fun fetchOrNull(collection: Collection, uid: String): Item? =
-        try {
-            fetch(collection, uid)
-        } catch (e: NotFoundException) {
-            null
+    /**
+     * The content of item [uid] (one this device has seen), or null when it is deleted. A deleted revision keeps its
+     * content, so the item is first fetched without it: a deleted attachment is not downloaded. (One deleted between
+     * the two requests has been transferred then, and its content is still the file: it is returned.)
+     */
+    suspend fun fetchContent(collection: Collection, uid: String): ByteArray? {
+        val revision = withContext(Dispatchers.IO) {
+            itemManager(collection).fetch(uid, FetchOptions().prefetch(PrefetchOption.Medium))
         }
-
-    /** The content of item [uid], or null when there is no such item. */
-    suspend fun fetchContent(collection: Collection, uid: String): ByteArray? =
-        fetchOrNull(collection, uid)?.let { item ->
-            item.content.also { check(item.uid == uid) } // the item stays reachable until its content is read
-        }
+        if (revision.isDeleted) return null
+        val item = fetch(collection, uid)
+        // holding the monitor keeps the item reachable while its content is read: the library frees the native item
+        // when the Java object is finalized (Reference.reachabilityFence needs API 28)
+        return synchronized(item) { item.content }
+    }
 
     /** A new attachment item, to be uploaded in the same batch as the VTODO that references it. */
     suspend fun createAttachment(collection: Collection, content: ByteArray): Item = withContext(Dispatchers.IO) {
@@ -112,24 +127,9 @@ class EtebaseClient(
         )
     }
 
-    /** Attachment item [uid] marked deleted, to be uploaded, or null when it is gone already. */
+    /** Attachment item [uid] marked deleted, to be uploaded, or null when this device does not have it (as listed). */
     suspend fun deleteAttachment(collection: Collection, uid: String): Item? =
-        try {
-            withContext(Dispatchers.IO) {
-                itemManager(collection)
-                    .fetch(uid, FetchOptions().prefetch(PrefetchOption.Medium))
-                    .takeIf { !it.isDeleted }
-                    ?.apply { delete() }
-            }
-        } catch (e: NotFoundException) {
-            null
-        }
-
-    /** The content of item [obj] in the list [calendar], or null when there is none. */
-    suspend fun vtodo(calendar: CaldavCalendar, obj: String): String? {
-        val collection = collection(calendar) ?: return null
-        return fetchContent(collection, obj)?.decodeToString()
-    }
+        cache.itemGet(itemManager(collection), collection.uid, uid)?.takeIf { !it.isDeleted }?.apply { delete() }
 
     suspend fun collection(calendar: CaldavCalendar): Collection? =
         calendar.url?.let { url ->
@@ -248,16 +248,26 @@ class EtebaseClient(
     }
 
     companion object {
+        /** False also for an item whose metadata cannot be read (handled, and skipped, as a task). */
         val Item.isAttachment: Boolean
-            get() = meta.itemType == EtebaseAttachments.ITEM_TYPE
+            get() = try {
+                meta.itemType == EtebaseAttachments.ITEM_TYPE
+            } catch (e: Exception) {
+                false
+            }
 
         /**
-         * Errors that end a sync (it is tried again later), unlike errors caused by one item, task or list (also any
-         * other HTTP status, such as 413 from a proxy for a large upload).
+         * Errors after which an operation is tried again by a later sync (a 500 also ends the list or task it occurred
+         * in, see [endsSync]), unlike errors caused by one item, which is skipped (also any other HTTP status, such as
+         * 413 from a proxy for a large upload).
          */
         val Throwable.isTransient: Boolean
-            get() = this is ConnectionException || this is ServerErrorException ||
-                this is TemporaryServerErrorException || this is UnauthorizedException || this is java.io.IOException
+            get() = this is ServerErrorException || endsSync
+
+        /** Errors that end the sync of the account: no connection, server unavailable, login, app stopped. */
+        val Throwable.endsSync: Boolean
+            get() = this is ConnectionException || this is TemporaryServerErrorException ||
+                this is UnauthorizedException || this is java.io.IOException || this is CancellationException
 
         private const val TYPE_TASKS = "etebase.vtodo"
         private const val MAX_FETCH = 30L

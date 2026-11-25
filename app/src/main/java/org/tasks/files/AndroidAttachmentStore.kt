@@ -51,7 +51,7 @@ class AndroidAttachmentStore(
     override suspend fun create(name: String, mimeType: String?, data: ByteArray): String? {
         val directory = preferences.attachmentsDirectory ?: return null
         // no path separator or leading dot from another device ever reaches the file system
-        val safe = name.replace(UNSAFE, "_").trim().trimStart('.').take(100).ifEmpty { "attachment" }
+        val safe = AttachmentStore.safeName(name)
         val baseName = safe.substringBeforeLast('.').ifEmpty { "attachment" }
         val extension = safe.substringAfterLast('.', "").ifEmpty {
             mimeType?.let { MimeTypeMap.getSingleton().getExtensionFromMimeType(it) } ?: "bin"
@@ -72,9 +72,5 @@ class AndroidAttachmentStore(
             FileHelper.delete(context, uri)
             null
         }
-    }
-
-    companion object {
-        private val UNSAFE = Regex("[\\\\/:*?\"<>|\\p{Cntrl}]")
     }
 }

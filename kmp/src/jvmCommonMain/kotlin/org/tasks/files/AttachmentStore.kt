@@ -28,4 +28,13 @@ interface AttachmentStore {
         override suspend fun mimeType(uri: String): String? = null
         override suspend fun create(name: String, mimeType: String?, data: ByteArray): String? = null
     }
+
+    companion object {
+        // path separators, characters Windows and SAF reject, control and format characters (such as U+202E)
+        private val UNSAFE = Regex("[\\\\/:*?\"<>|\\p{Cntrl}\\p{Cf}]")
+
+        /** [name] from another device as a file name: no path, no leading dot, at most 100 characters. */
+        fun safeName(name: String): String =
+            name.replace(UNSAFE, "_").trim().trimStart('.').take(100).ifEmpty { "attachment" }
+    }
 }

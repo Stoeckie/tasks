@@ -90,7 +90,9 @@ fun AttachmentRow(
                     modifier = Modifier.padding(top = 24.dp, bottom = 24.dp, end = 16.dp)
                 ) {
                     attachments.forEach {
-                        val mimeType = FileHelper.getMimeType(LocalContext.current, it.uri.toUri())
+                        val context = LocalContext.current
+                        // no uri: an EteSync attachment not on this device (yet)
+                        val mimeType = it.uri.takeIf(String::isNotEmpty)?.let { uri -> FileHelper.getMimeType(context, uri.toUri()) }
                         when {
                             mimeType?.startsWith("image/") == true ||
                                     mimeType?.startsWith("video/") == true -> {

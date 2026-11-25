@@ -47,10 +47,6 @@ import org.tasks.data.entity.Attachment
 import org.tasks.data.entity.TaskAttachment
 import org.tasks.etebase.EtebaseAttachments.Companion.itemContent
 import org.tasks.etebase.EtebaseAttachments.Companion.sha256
-import org.tasks.time.DateTimeUtils2.currentTimeMillis
-import org.tasks.time.DateTimeUtils2.setCurrentMillisFixed
-import org.tasks.time.DateTimeUtils2.setCurrentMillisSystem
-import org.tasks.etebase.EtebaseAttachments.Companion.Problem
 import java.io.IOException
 import java.nio.file.Files
 
@@ -192,7 +188,7 @@ class EtebaseSynchronizerTest : DatabaseTest() {
 
     private suspend fun linkFile(task: Long, id: String, data: ByteArray) {
         val uri = "mem:///local/$id"
-        (store as EtebaseLiveTest.MemStore).files[uri] = data
+        (store as org.tasks.etebase.sim.MemStore).files[uri] = data
         db.taskAttachmentDao().insert(TaskAttachment(remoteId = id, name = "$id.bin", uri = uri))
         val file = db.taskAttachmentDao().getAttachment(id)!!
         db.taskAttachmentDao().insert(listOf(Attachment(task = task, fileId = file.id!!, attachmentUid = id)))
@@ -214,7 +210,7 @@ class EtebaseSynchronizerTest : DatabaseTest() {
     @Test
     fun interruptedDownloadKeepsTheBase() = runBlocking {
         setUp()
-        store = EtebaseLiveTest.MemStore()
+        store = org.tasks.etebase.sim.MemStore()
         val f = data(1); val g = data(2); val h = data(3)
         val task = syncedTask(vtodo("t", "t", attach("F", f), attach("G", g)))
         linkFile(task.id, "F", f)
@@ -223,6 +219,7 @@ class EtebaseSynchronizerTest : DatabaseTest() {
         page = { listOf(item("t-item", vtodo("t", "t", attach("F", f), attach("H", h)))) }
         var offline = true
         client.stub {
+            onBlocking { isSeen(any(), any()) } doReturn true
             onBlocking { fetchContent(any(), any()) } doSuspendableAnswer {
                 if (offline) throw IOException("connection reset during the download")
                 files[it.getArgument<String>(1)]?.let(::itemContent)
@@ -238,7 +235,7 @@ class EtebaseSynchronizerTest : DatabaseTest() {
     @Test
     fun refusedUploadDoesNotStopTheOtherLists() = runBlocking {
         setUp()
-        store = EtebaseLiveTest.MemStore()
+        store = org.tasks.etebase.sim.MemStore()
         val collection2: Collection = mock {
             on { uid } doReturn "col2"
             on { stoken } doReturn "s1"
@@ -264,24 +261,26 @@ class EtebaseSynchronizerTest : DatabaseTest() {
         assertEquals("", sync())
         verifyBlocking(client) { uploadChanges(eq(collection2), any()) }
         assertTrue(dirtyDao.isDirty(caldavDao.getTask(big.id)!!.id) == true)
-        // the next sync pushes the task without the refused file, which the editor names; no retry before a day
-        assertEquals(mapOf("B" to ("B.bin" to Problem.NOT_UPLOADED)), EtebaseAttachments(db.taskAttachmentDao(), store).failures(big.id))
+        // the proxy accepts it now: the task is pushed with its attachment
         client.stub { onBlocking { uploadChanges(eq(collection), any()) } doReturn Unit }
         assertEquals("", sync())
-        verifyBlocking(client) { uploadChanges(eq(collection), argThat { this == listOf(pushed) }) }
+        verifyBlocking(client, org.mockito.kotlin.times(2)) { uploadChanges(eq(collection), argThat { this == listOf(attachment, pushed) }) }
         assertTrue(dirtyDao.isDirty(caldavDao.getTask(big.id)!!.id) != true)
-        verifyBlocking(client, org.mockito.kotlin.times(1)) { createAttachment(any(), any()) }
     }
 
-    /** REVIEW4 F5: a download that fails is tried again by a later sync, also when nothing changed on the server. */
+    /**
+     * REVIEW4 F5, REVIEW5 F7: a server error during a download leaves the page unconfirmed, so the next sync lists the
+     * task again and tries again (without a retry timer); the old base stays until then.
+     */
     @Test
-    fun failedDownloadIsTriedAgain() = runBlocking {
+    fun downloadThatTheServerCannotAnswerIsTriedAgainByTheNextSync() = runBlocking {
         setUp()
-        store = EtebaseLiveTest.MemStore()
+        store = org.tasks.etebase.sim.MemStore()
         val h = data(3)
         page = { listOf(item("t-item", vtodo("t", "t", attach("H", h)))) }
         var down = true
         client.stub {
+            onBlocking { isSeen(any(), any()) } doReturn true
             onBlocking { fetchContent(any(), any()) } doSuspendableAnswer {
                 if (down) throw ServerErrorException("500")
                 files[it.getArgument<String>(1)]?.let(::itemContent)
@@ -290,14 +289,11 @@ class EtebaseSynchronizerTest : DatabaseTest() {
         assertEquals("", sync())
         val task = taskDao.getAll().single()
         assertEquals(emptySet<String>(), linked(task.id))
+        assertNull(caldavDao.getCalendar("cal")!!.ctag) // listed again next time
         down = false
-        page = { emptyList() }
-        setCurrentMillisFixed(currentTimeMillis() + 2 * 60 * 60 * 1000)
-        try {
-            assertEquals("", sync())
-        } finally {
-            setCurrentMillisSystem()
-        }
+        assertEquals("", sync())
         assertEquals(setOf("H"), linked(task.id))
+        assertEquals(h.toList(), (store as org.tasks.etebase.sim.MemStore).files[db.taskAttachmentDao().getAttachment("H")!!.uri]!!.toList())
+        assertEquals("s1", caldavDao.getCalendar("cal")!!.ctag)
     }
 }

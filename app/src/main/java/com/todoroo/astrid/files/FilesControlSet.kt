@@ -55,7 +55,7 @@ class FilesControlSet : TaskEditControlFragment() {
         }
         val context = LocalContext.current
         val problems by produceState(emptyList(), viewState.attachments, viewState.list) {
-            value = problems(viewState.task.id, viewState.list, viewState.attachments)
+            value = problems(viewState.list, viewState.attachments)
         }
         AttachmentRow(
             attachments = viewState.attachments,
@@ -81,40 +81,32 @@ class FilesControlSet : TaskEditControlFragment() {
 
     /** Why EteSync does not synchronize attachments of a task: names and reasons (same limits as the sync). */
     private suspend fun problems(
-        task: Long,
         list: CaldavFilter,
         attachments: Collection<TaskAttachment>,
     ): List<Pair<String, String>> {
         if (!list.account.isEtebaseAccount) return emptyList()
-        val failures = etebaseAttachments.failures(task)
         var count = 0
         var bytes = 0L
-        val limits = attachments.mapNotNull { attachment ->
+        return attachments.mapNotNull { attachment ->
+            // no file: it is on the server, but not downloaded to this device (yet)
             val size = attachmentStore.size(attachment.uri)
-            val problem = size?.let { EtebaseAttachments.problem(it, count, bytes) }
-            if (size != null && problem == null) {
+            val problem = if (size == null) Problem.NOT_DOWNLOADED else etebaseAttachments.problem(size, count, bytes)
+            if (problem == null) {
                 count++
-                bytes += size
+                bytes += size ?: 0
             }
-            (problem ?: failures[attachment.remoteId]?.second)?.let { attachment.name to it }
+            problem?.let { attachment.name to message(it) }
         }
-        // attachments that never arrived here have no row, only their failure
-        val missing = failures
-            .filterKeys { id -> attachments.none { it.remoteId == id } }
-            .values
-            .toList()
-        return (limits + missing).map { (name, problem) -> name to message(problem) }
     }
 
     private fun message(problem: Problem) = when (problem) {
-        Problem.TOO_LARGE -> getString(R.string.attachment_not_synced_too_large, MIB_LIMIT)
+        Problem.TOO_LARGE -> getString(R.string.attachment_not_synced_too_large, etebaseAttachments.limits.maxBytes / MIB)
         Problem.TASK_LIMIT -> getString(
             R.string.attachment_not_synced_task_limit,
-            EtebaseAttachments.MAX_PER_TASK,
-            (EtebaseAttachments.MAX_TASK_BYTES / MIB).toInt(),
+            etebaseAttachments.limits.maxPerTask,
+            (etebaseAttachments.limits.maxTaskBytes / MIB).toInt(),
         )
         Problem.NOT_DOWNLOADED -> getString(R.string.attachment_not_synced_not_downloaded)
-        Problem.NOT_UPLOADED -> getString(R.string.attachment_not_synced_refused)
     }
 
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
@@ -177,6 +169,5 @@ class FilesControlSet : TaskEditControlFragment() {
         val TAG = R.string.TEA_ctrl_files_pref
         private const val FRAG_TAG_ADD_ATTACHMENT_DIALOG = "frag_tag_add_attachment_dialog"
         private const val MIB = 1024 * 1024
-        private const val MIB_LIMIT = EtebaseAttachments.MAX_BYTES / MIB
     }
 }
