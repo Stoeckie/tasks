@@ -52,6 +52,7 @@ import org.tasks.etebase.EtebaseClientFactory
 import org.tasks.etebase.EtebaseClientProvider
 import org.tasks.etebase.EtebaseSynchronizer
 import org.tasks.extensions.guarded
+import org.tasks.files.AttachmentStore
 import org.tasks.filters.CaldavListCache
 import org.tasks.filters.FilterPreferenceCodec
 import org.tasks.filters.FilterProvider
@@ -185,6 +186,7 @@ val commonModule = module {
     factory<Encryption> { get<KeyStoreEncryption>() }
     factory<EtebaseClientFactory> { get<EtebaseClientProvider>() }
     factoryOf(::EtebaseSynchronizer)
+    single<AttachmentStore> { AttachmentStore.None } // references stay on the server, untouched
     single { get<OkHttpClientFactory>().oauthClient(foreground = false) }
     single {
         GoogleTasksCredentials(

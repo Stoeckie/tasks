@@ -49,6 +49,8 @@ import org.tasks.etebase.EtebaseClientProvider
 import org.tasks.etebase.EtebaseSynchronizer
 import org.tasks.caldav.TasksBasicAuth
 import org.tasks.feed.BlogFeedChecker
+import org.tasks.files.AndroidAttachmentStore
+import org.tasks.files.AttachmentStore
 import org.tasks.http.HttpClientFactory
 import org.tasks.http.KtorClientFactory
 import org.tasks.http.OkHttpKtorClientFactory
@@ -385,6 +387,8 @@ class ApplicationModule {
         iCal: org.tasks.caldav.iCalendar,
         vtodoCache: VtodoCache,
         reporting: Reporting,
+        taskAttachmentDao: TaskAttachmentDao,
+        attachmentStore: AttachmentStore,
     ): EtebaseSynchronizer = EtebaseSynchronizer(
         caldavDao = caldavDao,
         dirtyDao = dirtyDao,
@@ -394,7 +398,13 @@ class ApplicationModule {
         iCal = iCal,
         vtodoCache = vtodoCache,
         reporting = reporting,
+        taskAttachmentDao = taskAttachmentDao,
+        attachmentStore = attachmentStore,
     )
+
+    @Provides
+    fun providesAttachmentStore(@ApplicationContext context: Context, preferences: Preferences): AttachmentStore =
+        AndroidAttachmentStore(context, preferences)
 
     @Provides
     fun providesEtebaseClientProvider(
